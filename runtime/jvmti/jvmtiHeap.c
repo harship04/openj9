@@ -111,6 +111,11 @@ static jvmtiIterationControl wrap_arrayPrimitiveValueCallback(J9JavaVM * vm, J9J
 static jvmtiIterationControl wrap_primitiveFieldCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData, IDATA wasReportedBefore);
 static jvmtiIterationControl wrap_stringPrimitiveCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData);
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+static jvmtiIterationControl iterateFlattenedSubValues(J9JavaVM *vm, J9JVMTIHeapData *iteratorData, j9object_t object, J9Class *clazz);
+static jvmtiIterationControl walkFlattenedValuePrimitiveFields(J9JavaVM *vm, J9JVMTIHeapData *iteratorData, J9Class *clazz, U_8 *base);
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 static void updateObjectTag(J9JVMTIHeapData * iteratorData, j9object_t object, jlong * originalTag, jlong newTag);
 static jvmtiPrimitiveType getArrayPrimitiveType(J9VMThread * vmThread, j9object_t  object, jlong * primitiveSize);
 static jvmtiError getArrayPrimitiveElements(J9JVMTIHeapData * iteratorData, jvmtiPrimitiveType * primitiveType, void **elements, jint elementCount);
@@ -637,6 +642,203 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 		JVMTI_HEAP_CHECK_ITERATION_ABORT(visitRc);
 	}
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+	/* Report FIELD references for flattened instance fields.
+	 * The GC walker skips them (inline bytes are not heap pointers), so we emit them here.
+	 */
+	if (iteratorData->callbacks->heap_reference_callback
+	    && (0 == wasReportedBefore)
+	    && !J9VM_IS_INITIALIZED_HEAPCLASS(vmThread, iteratorData->object)
+	    && !J9ROMCLASS_IS_ARRAY(clazz->romClass)
+	    && (NULL != clazz->flattenedClassCache)
+	    && (clazz->flattenedClassCache->numberOfEntries > 0)) {
+		UDATA numEntries = clazz->flattenedClassCache->numberOfEntries;
+		UDATA fi;
+		for (fi = 0; fi < numEntries; fi++) {
+			J9FlattenedClassCacheEntry *entry = J9_VM_FCC_ENTRY_FROM_CLASS(clazz, fi);
+			J9Class *flatClass;
+			J9JVMTIObjectTag flatTagEntry;
+			J9JVMTIObjectTag *flatTagResult;
+			jlong flatClassTag = 0;
+			jlong flatObjTag = 0;
+			jvmtiHeapReferenceInfo flatRefInfo;
+			jint flatVisitRc;
+
+			if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(entry)) {
+				continue;
+			}
+
+			flatClass = J9_VM_FCC_CLASS_FROM_ENTRY(entry);
+
+			if (!J9_IS_FIELD_FLATTENED(flatClass, entry->field)) {
+				continue;
+			}
+
+			flatTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(flatClass);
+			flatTagResult = hashTableFind(iteratorData->env->objectTagTable, &flatTagEntry);
+			flatClassTag = (NULL == flatTagResult) ? 0 : flatTagResult->tag;
+
+			if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && flatClassTag != 0) ||
+			    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && flatClassTag == 0)) {
+				continue;
+			}
+			if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != flatClass)) {
+				continue;
+			}
+
+			flatRefInfo.field.index = (jint)fi;
+			flatVisitRc = iteratorData->callbacks->heap_reference_callback(
+			                  JVMTI_HEAP_REFERENCE_FIELD,
+			                  &flatRefInfo,
+			                  flatClassTag,
+			                  iteratorData->tags.classTag,
+			                  (jlong)J9_VALUETYPE_FLATTENED_SIZE(flatClass),
+			                  &flatObjTag,
+			                  &iteratorData->tags.objectTag,
+			                  -1,
+			                  iteratorData->userData);
+			if (flatVisitRc & JVMTI_VISIT_ABORT) {
+				goto done;
+			}
+			/* Recurse into nested flattened fields of flatClass (e.g. Value2 -> v1, v2 : Value).
+			 * The GC walker never visits inlined values, so walk their FCC entries directly.
+			 */
+			if ((NULL != flatClass->flattenedClassCache)
+			    && (flatClass->flattenedClassCache->numberOfEntries > 0)) {
+				UDATA subNumEntries = flatClass->flattenedClassCache->numberOfEntries;
+				UDATA si;
+				for (si = 0; si < subNumEntries; si++) {
+					J9FlattenedClassCacheEntry *subEntry = J9_VM_FCC_ENTRY_FROM_CLASS(flatClass, si);
+					J9Class *subClass;
+					J9JVMTIObjectTag subTagEntry;
+					J9JVMTIObjectTag *subTagResult;
+					jlong subClassTag = 0;
+					jlong subObjTag = 0;
+					jvmtiHeapReferenceInfo subRefInfo;
+					jint subVisitRc;
+
+					if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(subEntry)) continue;
+					subClass = J9_VM_FCC_CLASS_FROM_ENTRY(subEntry);
+					if (!J9_IS_FIELD_FLATTENED(subClass, subEntry->field)) continue;
+
+					subTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(subClass);
+					subTagResult = hashTableFind(iteratorData->env->objectTagTable, &subTagEntry);
+					subClassTag = (NULL == subTagResult) ? 0 : subTagResult->tag;
+
+					if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && subClassTag != 0) ||
+					    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && subClassTag == 0)) continue;
+					if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != subClass)) continue;
+
+					subRefInfo.field.index = (jint)si;
+					subVisitRc = iteratorData->callbacks->heap_reference_callback(
+					                 JVMTI_HEAP_REFERENCE_FIELD,
+					                 &subRefInfo,
+					                 subClassTag,
+					                 flatClassTag,
+					                 (jlong)J9_VALUETYPE_FLATTENED_SIZE(subClass),
+					                 &subObjTag,
+					                 &flatObjTag,
+					                 -1,
+					                 iteratorData->userData);
+					if (subVisitRc & JVMTI_VISIT_ABORT) {
+						goto done;
+					}
+				}
+			}
+		}
+	}
+
+	/* Report ARRAY_ELEMENT references for each inline element of a flattened array.
+	 * Elements have no heap identity, so the GC walker never reports them individually.
+	 */
+	if (iteratorData->callbacks->heap_reference_callback
+	    && (0 == wasReportedBefore)
+	    && !J9VM_IS_INITIALIZED_HEAPCLASS(vmThread, iteratorData->object)
+	    && J9ROMCLASS_IS_ARRAY(clazz->romClass)
+	    && J9_IS_J9CLASS_FLATTENED(clazz)) {
+		J9ArrayClass *arrayClazz = (J9ArrayClass *)clazz;
+		J9Class *elemClass = arrayClazz->componentType;
+		UDATA elemCount = (UDATA)J9INDEXABLEOBJECT_SIZE(vmThread, (J9IndexableObject *)iteratorData->object);
+		J9JVMTIObjectTag elemTagEntry;
+		J9JVMTIObjectTag *elemTagResult;
+		jlong elemClassTag = 0;
+		UDATA ai;
+
+		elemTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(elemClass);
+		elemTagResult = hashTableFind(iteratorData->env->objectTagTable, &elemTagEntry);
+		elemClassTag = (NULL == elemTagResult) ? 0 : elemTagResult->tag;
+
+		if (!(((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && elemClassTag != 0) ||
+		      ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && elemClassTag == 0)) &&
+		    !((iteratorData->classFilter != NULL) && (iteratorData->classFilter != elemClass))) {
+			jlong elemObjSize = (jlong)J9_VALUETYPE_FLATTENED_SIZE(elemClass);
+			for (ai = 0; ai < elemCount; ai++) {
+				jvmtiHeapReferenceInfo elemRefInfo;
+				jlong elemObjTag = 0;
+				jint elemVisitRc;
+
+				elemRefInfo.array.index = (jint)ai;
+				elemVisitRc = iteratorData->callbacks->heap_reference_callback(
+				                  JVMTI_HEAP_REFERENCE_ARRAY_ELEMENT,
+				                  &elemRefInfo,
+				                  elemClassTag,
+				                  iteratorData->tags.classTag,
+				                  elemObjSize,
+				                  &elemObjTag,
+				                  &iteratorData->tags.objectTag,
+				                  -1,
+				                  iteratorData->userData);
+				if (elemVisitRc & JVMTI_VISIT_ABORT) {
+					goto done;
+				}
+				/* Recurse into nested flattened fields of each array element's class. */
+				if ((NULL != elemClass->flattenedClassCache)
+				    && (elemClass->flattenedClassCache->numberOfEntries > 0)) {
+					UDATA subNumEntries = elemClass->flattenedClassCache->numberOfEntries;
+					UDATA si;
+					for (si = 0; si < subNumEntries; si++) {
+						J9FlattenedClassCacheEntry *subEntry = J9_VM_FCC_ENTRY_FROM_CLASS(elemClass, si);
+						J9Class *subClass;
+						J9JVMTIObjectTag subTagEntry;
+						J9JVMTIObjectTag *subTagResult;
+						jlong subClassTag = 0;
+						jlong subObjTag = 0;
+						jvmtiHeapReferenceInfo subRefInfo;
+						jint subVisitRc;
+
+						if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(subEntry)) continue;
+						subClass = J9_VM_FCC_CLASS_FROM_ENTRY(subEntry);
+						if (!J9_IS_FIELD_FLATTENED(subClass, subEntry->field)) continue;
+
+						subTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(subClass);
+						subTagResult = hashTableFind(iteratorData->env->objectTagTable, &subTagEntry);
+						subClassTag = (NULL == subTagResult) ? 0 : subTagResult->tag;
+
+						if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && subClassTag != 0) ||
+						    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && subClassTag == 0)) continue;
+						if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != subClass)) continue;
+
+						subRefInfo.field.index = (jint)si;
+						subVisitRc = iteratorData->callbacks->heap_reference_callback(
+						                 JVMTI_HEAP_REFERENCE_FIELD,
+						                 &subRefInfo,
+						                 subClassTag,
+						                 elemClassTag,
+						                 (jlong)J9_VALUETYPE_FLATTENED_SIZE(subClass),
+						                 &subObjTag,
+						                 &elemObjTag,
+						                 -1,
+						                 iteratorData->userData);
+						if (subVisitRc & JVMTI_VISIT_ABORT) {
+							goto done;
+						}
+					}
+				}
+			}
+		}
+	}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 #ifdef JVMTI_HEAP_DEBUG
 	jvmtiHeapFollowReferencesPrint(vm, iteratorData->object, iteratorData->referrer, iteratorData);
 #endif
@@ -651,11 +853,22 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 	}
 
 	/* Callback for all primitive fields of this object */
-	if (iteratorData->callbacks->primitive_field_callback) { 
+	if (iteratorData->callbacks->primitive_field_callback) {
 		visitRc = wrap_primitiveFieldCallback(vm, iteratorData, wasReportedBefore);
 		JVMTI_HEAP_CHECK_RC(iteratorData->rc);
 		JVMTI_HEAP_CHECK_ITERATION_ABORT(visitRc);
 	}
+
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+	/* Fire heap_iteration_callback for flattened sub-values. */
+	if (iteratorData->callbacks->heap_iteration_callback
+	    && !J9VM_IS_INITIALIZED_HEAPCLASS(vmThread, iteratorData->object)) {
+		/* Re-read clazz from the current object — it may differ from the referrer's class. */
+		J9Class *objectClazz = J9OBJECT_CLAZZ(vmThread, iteratorData->object);
+		visitRc = iterateFlattenedSubValues(vm, iteratorData, iteratorData->object, objectClazz);
+		JVMTI_HEAP_CHECK_ITERATION_ABORT(visitRc);
+	}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 	/* TODO: There has got to be a better way of checking if an object is a String or not */
 	if (iteratorData->callbacks->string_primitive_value_callback) {
@@ -1429,6 +1642,17 @@ iterateThroughHeapCallback(J9JavaVM *vm, J9MM_IterateObjectDescriptor *objectDes
 		JVMTI_HEAP_CHECK_ITERATION_ABORT(visitRc);
 	}
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+	/* Fire heap_iteration_callback for each flattened sub-value of this object. */
+	if (iteratorData->callbacks->heap_iteration_callback
+	    && !J9VM_IS_INITIALIZED_HEAPCLASS(iteratorData->currentThread, object)) {
+		visitRc = iterateFlattenedSubValues(vm, iteratorData, object, clazz);
+		if (JVMTI_ITERATION_ABORT == visitRc) {
+			goto done;
+		}
+	}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 	/* TODO: There has got to be a better way of checking if an object is a String or not */
 	if (iteratorData->callbacks->string_primitive_value_callback) {
 		J9UTF8 *clazzName = J9ROMCLASS_CLASSNAME(clazz->romClass);
@@ -1444,6 +1668,7 @@ iterateThroughHeapCallback(J9JavaVM *vm, J9MM_IterateObjectDescriptor *objectDes
 done:
 	return JVMTI_ITERATION_ABORT;
 }
+
 
 
 
@@ -1559,6 +1784,253 @@ wrap_arrayPrimitiveValueCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData)
 }
 
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+
+/**
+ * \brief	Issue primitive_field_callback for each primitive field of a flattened value instance.
+ * \ingroup	jvmti.heap
+ *
+ * @param[in] vm            JavaVM structure
+ * @param[in] iteratorData  iteration structure containing misc data
+ * @param[in] clazz         the flattened value class whose fields are to be reported
+ * @param[in] base          pointer to the start of the flattened value payload in the heap
+ * @return                  JVMTI_ITERATION_ABORT if the user callback requested abort,
+ *                          JVMTI_ITERATION_CONTINUE otherwise
+ *
+ * Reports primitive fields directly and recurses into nested flattened sub-values.
+ */
+static jvmtiIterationControl
+walkFlattenedValuePrimitiveFields(J9JavaVM *vm, J9JVMTIHeapData *iteratorData, J9Class *clazz, U_8 *base)
+{
+	jvmtiIterationControl visitRc = JVMTI_ITERATION_CONTINUE;
+	J9Class *superClazz;
+	J9ROMFieldOffsetWalkState walkState;
+	J9ROMFieldOffsetWalkResult *result;
+	J9JVMTIObjectTag tagEntry;
+	J9JVMTIObjectTag *tagResult;
+	jlong classTag;
+
+	/* Look up the class tag once for all primitive fields of this value. */
+	tagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(clazz);
+	tagResult = hashTableFind(iteratorData->env->objectTagTable, &tagEntry);
+	classTag = (NULL == tagResult) ? 0 : tagResult->tag;
+
+	/* Walk instance fields: report primitives directly, recurse into nested flattened sub-values. */
+	superClazz = (J9CLASS_DEPTH(clazz) > 0)
+	           ? clazz->superclasses[J9CLASS_DEPTH(clazz) - 1]
+	           : NULL;
+	result = vm->internalVMFunctions->fieldOffsetsStartDo(
+	             vm, clazz->romClass, superClazz, &walkState,
+	             J9VM_FIELD_OFFSET_WALK_INCLUDE_INSTANCE,
+	             clazz->flattenedClassCache);
+
+	while (NULL != result->field) {
+		J9ROMFieldShape *field = result->field;
+		if (!(field->modifiers & J9AccStatic)) {
+			if (field->modifiers & J9FieldFlagObject) {
+				/* Flattened sub-value: recurse into its primitive fields. */
+				J9Class *subClass = result->flattenedClass;
+				if ((NULL != subClass) && J9_IS_FIELD_FLATTENED(subClass, field)) {
+					U_8 *subBase = base + result->offset;
+					visitRc = walkFlattenedValuePrimitiveFields(vm, iteratorData, subClass, subBase);
+					if (JVMTI_ITERATION_ABORT == visitRc) {
+						return JVMTI_ITERATION_ABORT;
+					}
+				}
+			} else {
+				/* Direct primitive field of this value. */
+				J9UTF8 *sig = J9ROMFIELDSHAPE_SIGNATURE(field);
+				jvmtiPrimitiveType primType;
+				if (JVMTI_ERROR_NONE == getPrimitiveType(sig, &primType)) {
+					void *ptr = base + result->offset;
+					jvalue val;
+					jvmtiHeapReferenceInfo info;
+					jlong objTag = 0;
+					val.j = (jlong)0;
+					fillInJValue(J9UTF8_DATA(sig)[0], &val, ptr, NULL);
+					info.field.index = (jint)result->index;
+					visitRc = iteratorData->callbacks->primitive_field_callback(
+					              JVMTI_HEAP_REFERENCE_FIELD, &info,
+					              classTag, &objTag,
+					              val, primType,
+					              iteratorData->userData);
+					if (visitRc & JVMTI_VISIT_ABORT) {
+						return JVMTI_ITERATION_ABORT;
+					}
+				}
+			}
+		}
+		result = vm->internalVMFunctions->fieldOffsetsNextDo(&walkState);
+	}
+
+	return JVMTI_ITERATION_CONTINUE;
+}
+
+/**
+ * \brief	Issue heap_iteration_callback for each flattened sub-value reachable from object.
+ * \ingroup	jvmti.heap
+ *
+ * @param[in] vm            JavaVM structure
+ * @param[in] iteratorData  iteration structure containing misc data
+ * @param[in] object        the heap object being walked
+ * @param[in] clazz         J9Class of object
+ * @return                  JVMTI_ITERATION_ABORT if the user callback requested abort,
+ *                          JVMTI_ITERATION_CONTINUE otherwise
+ *
+ * For flattened arrays, fires one callback per inline element.  For non-array objects,
+ * walks flattened instance fields depth-first via flattenedClassCache.
+ * Shared between iterateThroughHeapCallback and followReferencesCallback.
+ */
+static jvmtiIterationControl
+iterateFlattenedSubValues(J9JavaVM *vm, J9JVMTIHeapData *iteratorData, j9object_t object, J9Class *clazz)
+{
+#define FLAT_STACK_DEPTH 64
+	struct { J9Class *clazz; U_8 *base; } flatStack[FLAT_STACK_DEPTH];
+	int flatTop = 0;
+
+	if (J9ROMCLASS_IS_ARRAY(clazz->romClass)) {
+		if (J9_IS_J9CLASS_FLATTENED(clazz)) {
+			J9ArrayClass *arrayClazz = (J9ArrayClass *)clazz;
+			J9Class *elemClass = arrayClazz->componentType;
+			UDATA elemCount = (UDATA)J9INDEXABLEOBJECT_SIZE(iteratorData->currentThread,
+			                                                 (J9IndexableObject *)object);
+			J9JVMTIObjectTag elemEntry;
+			J9JVMTIObjectTag *elemTagResult;
+			jlong elemClassTag = 0;
+			BOOLEAN elemFiltered = FALSE;
+			UDATA i;
+			/* J9ARRAYCLASS_GET_STRIDE includes element padding. J9JAVAARRAY_EA at index 0
+			 * gives the data base pointer for both adjacent and off-heap array layouts. */
+			UDATA elemStride = J9ARRAYCLASS_GET_STRIDE(clazz);
+			U_8 *arrayBase = (U_8 *)J9JAVAARRAY_EA(iteratorData->currentThread,
+			                                        object, 0, U_8);
+
+			elemEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(elemClass);
+			elemTagResult = hashTableFind(iteratorData->env->objectTagTable, &elemEntry);
+			elemClassTag = (NULL == elemTagResult) ? 0 : elemTagResult->tag;
+
+			if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && elemClassTag != 0) ||
+			    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && elemClassTag == 0)) {
+				elemFiltered = TRUE;
+			}
+			if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != elemClass)) {
+				elemFiltered = TRUE;
+			}
+
+			for (i = 0; i < elemCount; i++) {
+				U_8 *elemBase = arrayBase + i * elemStride;
+
+				if (!elemFiltered) {
+					/* object_tag=0: inline elements have no independent heap identity. */
+					jlong elemObjectTag = 0;
+					jlong elemObjectSize = (jlong)J9_VALUETYPE_FLATTENED_SIZE(elemClass);
+					jint iterCbRc = iteratorData->callbacks->heap_iteration_callback(
+					                    elemClassTag,
+					                    elemObjectSize,
+					                    &elemObjectTag,
+					                    -1,
+					                    iteratorData->userData);
+					if (iterCbRc & JVMTI_VISIT_ABORT) {
+						return JVMTI_ITERATION_ABORT;
+					}
+				}
+
+				/* Push element so its own flattened sub-fields are also walked. */
+				if (flatTop < FLAT_STACK_DEPTH) {
+					flatStack[flatTop].clazz = elemClass;
+					flatStack[flatTop].base = elemBase;
+					flatTop++;
+				}
+			}
+		}
+	} else {
+		/* Non-array object: seed the stack with its flattened instance fields. */
+		if ((NULL != clazz->flattenedClassCache)
+		    && (clazz->flattenedClassCache->numberOfEntries > 0)) {
+			flatStack[flatTop].clazz = clazz;
+			flatStack[flatTop].base = (U_8 *)object + J9JAVAVM_OBJECT_HEADER_SIZE(vm);
+			flatTop++;
+		}
+	}
+
+	/* Depth-first walk of nested flattened fields. */
+	while (flatTop > 0) {
+		J9Class *curClazz;
+		U_8 *curBase;
+		UDATA numEntries;
+		UDATA j;
+
+		flatTop--;
+		curClazz = flatStack[flatTop].clazz;
+		curBase = flatStack[flatTop].base;
+
+		/* No flattened sub-fields — skip. */
+		if ((NULL == curClazz->flattenedClassCache)
+		    || (0 == curClazz->flattenedClassCache->numberOfEntries)) {
+			continue;
+		}
+
+		/* Iterate FCC entries directly: each entry is a flattened instance field. */
+		numEntries = curClazz->flattenedClassCache->numberOfEntries;
+		for (j = 0; j < numEntries; j++) {
+			J9FlattenedClassCacheEntry *entry = J9_VM_FCC_ENTRY_FROM_CLASS(curClazz, j);
+			J9Class *flatClass;
+			U_8 *flatBase;
+			J9JVMTIObjectTag flatTagEntry;
+			J9JVMTIObjectTag *flatTagResult;
+			jlong flatClassTag = 0;
+			BOOLEAN filtered = FALSE;
+
+			/* Skip static flattened fields. */
+			if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(entry)) {
+				continue;
+			}
+
+			flatClass = J9_VM_FCC_CLASS_FROM_ENTRY(entry);
+			flatBase = curBase + entry->offset;
+
+			flatTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(flatClass);
+			flatTagResult = hashTableFind(iteratorData->env->objectTagTable, &flatTagEntry);
+			flatClassTag = (NULL == flatTagResult) ? 0 : flatTagResult->tag;
+
+			if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && flatClassTag != 0) ||
+			    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && flatClassTag == 0)) {
+				filtered = TRUE;
+			}
+			if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != flatClass)) {
+				filtered = TRUE;
+			}
+
+			if (!filtered) {
+				/* object_tag=0, length=-1: flattened values have no heap identity. */
+				jlong flatObjectTag = 0;
+				jlong flatObjectSize = (jlong)J9_VALUETYPE_FLATTENED_SIZE(flatClass);
+				jint iterCbRc = iteratorData->callbacks->heap_iteration_callback(
+				                    flatClassTag,
+				                    flatObjectSize,
+				                    &flatObjectTag,
+				                    -1,
+				                    iteratorData->userData);
+				if (iterCbRc & JVMTI_VISIT_ABORT) {
+					return JVMTI_ITERATION_ABORT;
+				}
+			}
+
+			/* Push so nested sub-fields are also walked. */
+			if (flatTop < FLAT_STACK_DEPTH) {
+				flatStack[flatTop].clazz = flatClass;
+				flatStack[flatTop].base = flatBase;
+				flatTop++;
+			}
+		}
+	}
+#undef FLAT_STACK_DEPTH
+	return JVMTI_ITERATION_CONTINUE;
+}
+
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
+
 /** 
  * \brief	Wrapper for the Field Primitive <code>jvmtiPrimitiveFieldCallback</code> user callback
  * \ingroup 	jvmti.heap
@@ -1599,7 +2071,33 @@ wrap_primitiveFieldCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData, IDATA
 	rc = getCurrentVMThread(vm, &currentThread);
 	if (rc != JVMTI_ERROR_NONE) {
 		JVMTI_HEAP_ERROR(rc);
-	} 
+	}
+
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+	/* Flattened array: walk primitive fields of each inline element. */
+	if (!J9VM_IS_INITIALIZED_HEAPCLASS(iteratorData->currentThread, iteratorData->object)
+	    && J9ROMCLASS_IS_ARRAY(iteratorData->clazz->romClass)
+	    && J9_IS_J9CLASS_FLATTENED(iteratorData->clazz)) {
+		J9ArrayClass *arrayClazz = (J9ArrayClass *)iteratorData->clazz;
+		J9Class *elemClass = arrayClazz->componentType;
+		UDATA arrElemCount = (UDATA)J9INDEXABLEOBJECT_SIZE(iteratorData->currentThread,
+		                                                   (J9IndexableObject *)iteratorData->object);
+		/* J9ARRAYCLASS_GET_STRIDE includes element padding. J9JAVAARRAY_EA at index 0
+		 * gives the data base pointer for both adjacent and off-heap array layouts. */
+		UDATA arrStride = J9ARRAYCLASS_GET_STRIDE(iteratorData->clazz);
+		U_8 *arrBase = (U_8 *)J9JAVAARRAY_EA(iteratorData->currentThread,
+		                                      iteratorData->object, 0, U_8);
+		UDATA arrIdx;
+		for (arrIdx = 0; arrIdx < arrElemCount; arrIdx++) {
+			U_8 *arrElemBase = arrBase + arrIdx * arrStride;
+			visitRc = walkFlattenedValuePrimitiveFields(vm, iteratorData, elemClass, arrElemBase);
+			if (JVMTI_ITERATION_ABORT == visitRc) {
+				return JVMTI_ITERATION_ABORT;
+			}
+		}
+		return JVMTI_ITERATION_CONTINUE;
+	}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 	/* If the object is a Class or an Interface, then set the kind to JVMTI_HEAP_REFERENCE_STATIC_FIELD */
 	if (J9VM_IS_INITIALIZED_HEAPCLASS(iteratorData->currentThread, iteratorData->object) || (iteratorData->clazz->romClass->modifiers & J9AccInterface)) {
@@ -1632,8 +2130,20 @@ wrap_primitiveFieldCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData, IDATA
 		jlong tag = iteratorData->tags.objectTag;
 		J9UTF8 * fieldSignature = J9ROMFIELDSHAPE_SIGNATURE(field); 
 
-		/* We are not interested in Object fields */
+		/* Skip Object fields; for flattened value types, report primitive sub-fields. */
 		if (field->modifiers & J9FieldFlagObject) {
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+			if (fieldKind == JVMTI_HEAP_REFERENCE_FIELD) {
+				J9Class *flatClass = state.fieldOffsetWalkState.result.flattenedClass;
+				if ((NULL != flatClass) && J9_IS_FIELD_FLATTENED(flatClass, field)) {
+					U_8 *flatBase = (U_8 *)iteratorData->object + state.fieldOffset + objectHeaderSize;
+					visitRc = walkFlattenedValuePrimitiveFields(vm, iteratorData, flatClass, flatBase);
+					if (JVMTI_ITERATION_ABORT == visitRc) {
+						return JVMTI_ITERATION_ABORT;
+					}
+				}
+			}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 #ifdef JVMTI_HEAP_DEBUG
 			{
 				J9UTF8 * fieldName = J9ROMFIELDSHAPE_NAME(field);
