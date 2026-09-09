@@ -645,6 +645,9 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 #if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
 	/* Report FIELD references for flattened instance fields.
 	 * The GC walker skips them (inline bytes are not heap pointers), so we emit them here.
+	 * For each flattened value we allocate an unflattened proxy object and store it in
+	 * objectTagTable so the tag persists across followReferences() calls and is visible
+	 * to GetObjectsWithTags(). The proxy is kept alive as a GC root by the tag table.
 	 */
 	if (iteratorData->callbacks->heap_reference_callback
 	    && (0 == wasReportedBefore)
@@ -661,23 +664,20 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 			J9JVMTIObjectTag *flatTagResult;
 			jlong flatClassTag = 0;
 			jlong flatObjTag = 0;
+			jlong flatObjTagBefore = 0;
 			jvmtiHeapReferenceInfo flatRefInfo;
 			jint flatVisitRc;
-
+			j9object_t flatProxy;
 			if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(entry)) {
 				continue;
 			}
-
 			flatClass = J9_VM_FCC_CLASS_FROM_ENTRY(entry);
-
 			if (!J9_IS_FIELD_FLATTENED(flatClass, entry->field)) {
 				continue;
 			}
-
 			flatTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(flatClass);
 			flatTagResult = hashTableFind(iteratorData->env->objectTagTable, &flatTagEntry);
 			flatClassTag = (NULL == flatTagResult) ? 0 : flatTagResult->tag;
-
 			if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && flatClassTag != 0) ||
 			    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && flatClassTag == 0)) {
 				continue;
@@ -685,7 +685,30 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 			if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != flatClass)) {
 				continue;
 			}
-
+			/* Allocate an unflattened proxy object and copy the inline field bytes into it.
+			 * Try fast path (no GC) first; fall back to slow path if it fails.
+			 */
+			flatProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+			                vmThread, flatClass, iteratorData->object,
+			                entry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
+			if (NULL == flatProxy) {
+				flatProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+				                vmThread, flatClass, iteratorData->object,
+				                entry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), FALSE);
+			}
+			if (NULL == flatProxy) {
+				iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
+				goto done;
+			}
+			/* Load any existing tag for this proxy so run 2+ sees the tag from run 1. */
+			{
+				J9JVMTIObjectTag proxySearch;
+				J9JVMTIObjectTag *proxyEntry;
+				proxySearch.ref = flatProxy;
+				proxyEntry = hashTableFind(iteratorData->env->objectTagTable, &proxySearch);
+				flatObjTagBefore = (NULL == proxyEntry) ? 0 : proxyEntry->tag;
+				flatObjTag = flatObjTagBefore;
+			}
 			flatRefInfo.field.index = (jint)fi;
 			flatVisitRc = iteratorData->callbacks->heap_reference_callback(
 			                  JVMTI_HEAP_REFERENCE_FIELD,
@@ -700,6 +723,10 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 			if (flatVisitRc & JVMTI_VISIT_ABORT) {
 				goto done;
 			}
+			/* Persist any tag change the agent made. After this the proxy is in
+			 * objectTagTable and the GC root scanner keeps it alive.
+			 */
+			updateObjectTag(iteratorData, flatProxy, &flatObjTagBefore, flatObjTag);
 			/* Recurse into nested flattened fields of flatClass (e.g. Value2 -> v1, v2 : Value).
 			 * The GC walker never visits inlined values, so walk their FCC entries directly.
 			 */
@@ -714,21 +741,42 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 					J9JVMTIObjectTag *subTagResult;
 					jlong subClassTag = 0;
 					jlong subObjTag = 0;
+					jlong subObjTagBefore = 0;
 					jvmtiHeapReferenceInfo subRefInfo;
 					jint subVisitRc;
-
+					j9object_t subProxy;
 					if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(subEntry)) continue;
 					subClass = J9_VM_FCC_CLASS_FROM_ENTRY(subEntry);
 					if (!J9_IS_FIELD_FLATTENED(subClass, subEntry->field)) continue;
-
 					subTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(subClass);
 					subTagResult = hashTableFind(iteratorData->env->objectTagTable, &subTagEntry);
 					subClassTag = (NULL == subTagResult) ? 0 : subTagResult->tag;
-
 					if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && subClassTag != 0) ||
 					    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && subClassTag == 0)) continue;
 					if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != subClass)) continue;
-
+					/* Allocate proxy for the sub-value. srcObject is the flatProxy (already
+					 * an unflattened heap object), field offset within it is subEntry->offset.
+					 */
+					subProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+					               vmThread, subClass, flatProxy,
+					               subEntry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
+					if (NULL == subProxy) {
+						subProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+						               vmThread, subClass, flatProxy,
+						               subEntry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), FALSE);
+					}
+					if (NULL == subProxy) {
+						iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
+						goto done;
+					}
+					{
+						J9JVMTIObjectTag subSearch;
+						J9JVMTIObjectTag *subExisting;
+						subSearch.ref = subProxy;
+						subExisting = hashTableFind(iteratorData->env->objectTagTable, &subSearch);
+						subObjTagBefore = (NULL == subExisting) ? 0 : subExisting->tag;
+						subObjTag = subObjTagBefore;
+					}
 					subRefInfo.field.index = (jint)si;
 					subVisitRc = iteratorData->callbacks->heap_reference_callback(
 					                 JVMTI_HEAP_REFERENCE_FIELD,
@@ -743,13 +791,15 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 					if (subVisitRc & JVMTI_VISIT_ABORT) {
 						goto done;
 					}
+					updateObjectTag(iteratorData, subProxy, &subObjTagBefore, subObjTag);
 				}
 			}
 		}
 	}
-
 	/* Report ARRAY_ELEMENT references for each inline element of a flattened array.
 	 * Elements have no heap identity, so the GC walker never reports them individually.
+	 * A proxy object is allocated per element and stored in objectTagTable to make the
+	 * tag persistent and visible to GetObjectsWithTags().
 	 */
 	if (iteratorData->callbacks->heap_reference_callback
 	    && (0 == wasReportedBefore)
@@ -763,11 +813,9 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 		J9JVMTIObjectTag *elemTagResult;
 		jlong elemClassTag = 0;
 		UDATA ai;
-
 		elemTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(elemClass);
 		elemTagResult = hashTableFind(iteratorData->env->objectTagTable, &elemTagEntry);
 		elemClassTag = (NULL == elemTagResult) ? 0 : elemTagResult->tag;
-
 		if (!(((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && elemClassTag != 0) ||
 		      ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && elemClassTag == 0)) &&
 		    !((iteratorData->classFilter != NULL) && (iteratorData->classFilter != elemClass))) {
@@ -775,9 +823,33 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 			for (ai = 0; ai < elemCount; ai++) {
 				jvmtiHeapReferenceInfo elemRefInfo;
 				jlong elemObjTag = 0;
+				jlong elemObjTagBefore = 0;
 				jint elemVisitRc;
-
+				j9object_t elemProxy;
 				elemRefInfo.array.index = (jint)ai;
+				/* Allocate proxy via loadFlattenableArrayElement — same function used
+				 * by JNI aaload for flattened arrays. Allocates a new heap object and
+				 * copies the element's inline bytes into it.
+				 */
+				elemProxy = vm->internalVMFunctions->loadFlattenableArrayElement(
+				                vmThread, iteratorData->object, (U_32)ai, TRUE);
+				if (NULL == elemProxy) {
+					elemProxy = vm->internalVMFunctions->loadFlattenableArrayElement(
+					                vmThread, iteratorData->object, (U_32)ai, FALSE);
+				}
+				if (NULL == elemProxy) {
+					iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
+					goto done;
+				}
+				/* Load any existing tag for this proxy. */
+				{
+					J9JVMTIObjectTag elemSearch;
+					J9JVMTIObjectTag *elemExisting;
+					elemSearch.ref = elemProxy;
+					elemExisting = hashTableFind(iteratorData->env->objectTagTable, &elemSearch);
+					elemObjTagBefore = (NULL == elemExisting) ? 0 : elemExisting->tag;
+					elemObjTag = elemObjTagBefore;
+				}
 				elemVisitRc = iteratorData->callbacks->heap_reference_callback(
 				                  JVMTI_HEAP_REFERENCE_ARRAY_ELEMENT,
 				                  &elemRefInfo,
@@ -791,6 +863,8 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 				if (elemVisitRc & JVMTI_VISIT_ABORT) {
 					goto done;
 				}
+				/* Persist any tag change. Proxy enters objectTagTable as a GC root. */
+				updateObjectTag(iteratorData, elemProxy, &elemObjTagBefore, elemObjTag);
 				/* Recurse into nested flattened fields of each array element's class. */
 				if ((NULL != elemClass->flattenedClassCache)
 				    && (elemClass->flattenedClassCache->numberOfEntries > 0)) {
@@ -803,21 +877,40 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 						J9JVMTIObjectTag *subTagResult;
 						jlong subClassTag = 0;
 						jlong subObjTag = 0;
+						jlong subObjTagBefore = 0;
 						jvmtiHeapReferenceInfo subRefInfo;
 						jint subVisitRc;
-
+						j9object_t subProxy;
 						if (J9_VM_FCC_ENTRY_IS_STATIC_FIELD(subEntry)) continue;
 						subClass = J9_VM_FCC_CLASS_FROM_ENTRY(subEntry);
 						if (!J9_IS_FIELD_FLATTENED(subClass, subEntry->field)) continue;
-
 						subTagEntry.ref = J9VM_J9CLASS_TO_HEAPCLASS(subClass);
 						subTagResult = hashTableFind(iteratorData->env->objectTagTable, &subTagEntry);
 						subClassTag = (NULL == subTagResult) ? 0 : subTagResult->tag;
-
 						if (((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_TAGGED)   && subClassTag != 0) ||
 						    ((iteratorData->filter & JVMTI_HEAP_FILTER_CLASS_UNTAGGED) && subClassTag == 0)) continue;
 						if ((iteratorData->classFilter != NULL) && (iteratorData->classFilter != subClass)) continue;
-
+						/* Allocate proxy for the sub-value using the element proxy as source. */
+						subProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+						               vmThread, subClass, elemProxy,
+						               subEntry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
+						if (NULL == subProxy) {
+							subProxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
+							               vmThread, subClass, elemProxy,
+							               subEntry->offset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), FALSE);
+						}
+						if (NULL == subProxy) {
+							iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
+							goto done;
+						}
+						{
+							J9JVMTIObjectTag subSearch;
+							J9JVMTIObjectTag *subExisting;
+							subSearch.ref = subProxy;
+							subExisting = hashTableFind(iteratorData->env->objectTagTable, &subSearch);
+							subObjTagBefore = (NULL == subExisting) ? 0 : subExisting->tag;
+							subObjTag = subObjTagBefore;
+						}
 						subRefInfo.field.index = (jint)si;
 						subVisitRc = iteratorData->callbacks->heap_reference_callback(
 						                 JVMTI_HEAP_REFERENCE_FIELD,
@@ -832,19 +925,19 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 						if (subVisitRc & JVMTI_VISIT_ABORT) {
 							goto done;
 						}
+						updateObjectTag(iteratorData, subProxy, &subObjTagBefore, subObjTag);
 					}
 				}
 			}
 		}
 	}
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
-
 #ifdef JVMTI_HEAP_DEBUG
 	jvmtiHeapFollowReferencesPrint(vm, iteratorData->object, iteratorData->referrer, iteratorData);
 #endif
 
 
-	/* Is this an Array Object? If so then issue a user callback and pass along the array primitive elements */ 
+	/* Is this an Array Object? If so then issue a user callback and pass along the array primitive elements */
 	if (iteratorData->callbacks->array_primitive_value_callback &&
 			J9ROMCLASS_IS_PRIMITIVE_OR_ARRAY(clazz->romClass)) {
 		visitRc = wrap_arrayPrimitiveValueCallback(vm, iteratorData);
@@ -869,7 +962,6 @@ followReferencesCallback(j9object_t *slotPtr, j9object_t referrer, void *userDat
 		JVMTI_HEAP_CHECK_ITERATION_ABORT(visitRc);
 	}
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
-
 	/* TODO: There has got to be a better way of checking if an object is a String or not */
 	if (iteratorData->callbacks->string_primitive_value_callback) {
 		J9UTF8 *clazzName = J9ROMCLASS_CLASSNAME(clazz->romClass);
