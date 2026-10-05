@@ -389,6 +389,12 @@ jvmtiGetObjectsWithTags(jvmtiEnv* env,
 		results.forLen = tag_count;
 
 		hashTableForEachDo(((J9JVMTIEnv *)env)->objectTagTable, (J9HashTableDoFn) countObjectTags, &results);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+		/* Also count proxy entries stored in valueTypeObjectTagTable by processFlatRefs(). */
+		if (NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable) {
+			hashTableForEachDo(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, (J9HashTableDoFn) countObjectTags, &results);
+		}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 		if (object_result_ptr) {
 			results.objects = j9mem_allocate_memory(sizeof(jobject) * results.count, J9MEM_CATEGORY_JVMTI_ALLOCATE);
@@ -418,6 +424,12 @@ jvmtiGetObjectsWithTags(jvmtiEnv* env,
 			/* Fill in elements ... unwinds results.count */
 			if (object_result_ptr || tag_result_ptr) {
 				hashTableForEachDo(((J9JVMTIEnv *)env)->objectTagTable, (J9HashTableDoFn) copyObjectTags, &results);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+				/* Also copy proxy entries stored in valueTypeObjectTagTable by processFlatRefs(). */
+				if (NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable) {
+					hashTableForEachDo(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, (J9HashTableDoFn) copyObjectTags, &results);
+				}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 			}
 
 		} else {
@@ -2112,6 +2124,7 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 	for (i = 0; i < iteratorData->flatRefCount; i++) {
 		J9JVMTIFlatRefRecord *rec = &iteratorData->flatRefs[i];
 		j9object_t proxy = NULL;
+		j9object_t parentProxy = NULL;
 		J9JVMTIObjectTag search;
 		J9JVMTIObjectTag *existing;
 		jlong tagBefore;
@@ -2120,6 +2133,10 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 		jlong referrerObjTag;
 		jvmtiHeapReferenceInfo refInfo;
 		jint visitRc;
+
+		if (rec->parentIdx >= 0) {
+			parentProxy = proxies[rec->parentIdx];
+		}
 
 		if (JVMTI_HEAP_REFERENCE_ARRAY_ELEMENT == rec->refKind) {
 			proxy = vm->internalVMFunctions->loadFlattenableArrayElement(
@@ -2140,7 +2157,6 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 			}
 		} else {
 			/* Nested sub-value: src is the parent's already-allocated proxy */
-			j9object_t parentProxy = proxies[rec->parentIdx];
 			proxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
 			            vmThread, rec->flatClass, parentProxy,
 			            rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
@@ -2158,9 +2174,11 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 		}
 		proxies[i] = proxy;
 
-		/* Search existing tag in objectTagTable */
+		/* Search the valueTypeObjectTagTable for an existing tag from a previous call.
+		 * Proxies in this table are scanned as hard GC roots so they survive collection
+		 * and the entry is still present here on the second FollowReferences() call. */
 		search.ref = proxy;
-		existing   = hashTableFind(iteratorData->env->objectTagTable, &search);
+		existing   = hashTableFind(iteratorData->env->valueTypeObjectTagTable, &search);
 		tagBefore  = (NULL == existing) ? 0 : existing->tag;
 		tag        = tagBefore;
 
@@ -2171,7 +2189,7 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 			J9JVMTIObjectTag parentSearch;
 			J9JVMTIObjectTag *parentEntry;
 			parentSearch.ref = proxies[rec->parentIdx];
-			parentEntry = hashTableFind(iteratorData->env->objectTagTable, &parentSearch);
+			parentEntry = hashTableFind(iteratorData->env->valueTypeObjectTagTable, &parentSearch);
 			referrerObjTag = (NULL == parentEntry) ? 0 : parentEntry->tag;
 		}
 
@@ -2191,7 +2209,33 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 		              -1,
 		              iteratorData->userData);
 
-		updateObjectTag(iteratorData, proxy, &tagBefore, tag);
+		/* Persist the (possibly updated) tag into valueTypeObjectTagTable, not objectTagTable,
+		 * so the entry is scanned as a hard GC root and survives collection. */
+		if (tagBefore != 0) {
+			if (tag != 0) {
+				if (tagBefore != tag) {
+					/* tag changed — update in place */
+					J9JVMTIObjectTag updateEntry;
+					J9JVMTIObjectTag *found;
+					updateEntry.ref = proxy;
+					found = hashTableFind(iteratorData->env->valueTypeObjectTagTable, &updateEntry);
+					if (NULL != found) {
+						found->tag = tag;
+					}
+				}
+			} else {
+				/* tag removed */
+				J9JVMTIObjectTag removeEntry;
+				removeEntry.ref = proxy;
+				hashTableRemove(iteratorData->env->valueTypeObjectTagTable, &removeEntry);
+			}
+		} else if (tag != 0) {
+			/* newly tagged — add entry */
+			J9JVMTIObjectTag newEntry;
+			newEntry.ref = proxy;
+			newEntry.tag = tag;
+			hashTableAdd(iteratorData->env->valueTypeObjectTagTable, &newEntry);
+		}
 
 		if (visitRc & JVMTI_VISIT_ABORT) {
 			rc = JVMTI_ITERATION_ABORT;
