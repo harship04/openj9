@@ -901,6 +901,12 @@ MM_RootScanner::scanJVMTIObjectTagTables(MM_EnvironmentBase *env)
 }
 
 #if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+void
+MM_RootScanner::doValueTypeObjectTagSlot(J9Object **slotPtr)
+{
+	doSlot(slotPtr);
+}
+
 /**
  * Walk every proxy object stored in the JVMTI valueTypeObjectTagTable
  * and tell the GC to keep it alive (or update its address if it moved).
