@@ -541,7 +541,7 @@ public:
 	 * @note Never remove the entry here — only the agent or env shutdown does that.
 	 * @note The default empty body is fine for collectors that do not move objects.
 	 */
-	virtual void doValueTypeObjectTagSlot(J9Object **slotPtr) {}
+	virtual void doValueTypeObjectTagSlot(J9Object **slotPtr);
 	/**
 	 * Walk every proxy object in the valueTypeObjectTagTable of each JVMTI
 	 * environment and call doValueTypeObjectTagSlot() on it.
