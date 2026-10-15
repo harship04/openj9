@@ -34,6 +34,7 @@
 
 /* #define J9VM_DBG */
 
+#include <stdio.h>
 #include <string.h>
 #include "j9.h"
 #include "j9cfg.h"
@@ -114,7 +115,7 @@ updateExclusiveVMAccessStats(J9VMThread* currentThread)
 }
 
 
-void  
+void
 acquireExclusiveVMAccess(J9VMThread * vmThread)
 {
 	UDATA responsesExpected = 0;
@@ -122,6 +123,15 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 	J9JavaVM* vm = vmThread->javaVM;
 	PORT_ACCESS_FROM_JAVAVM(vm);
 	J9VMThread * currentThread;
+
+	/* DIAG-XACCESS-ENTER */
+	fprintf(stderr,
+		"[XACCESS-ENTER] thread=%p inNative=%d publicFlags=0x%zx exclusiveState=%zu\n",
+		(void *)vmThread,
+		(int)vmThread->inNative,
+		(size_t)vmThread->publicFlags,
+		(size_t)vm->exclusiveAccessState);
+	fflush(stderr);
 
 	Trc_VM_acquireExclusiveVMAccess_Entry(vmThread);
 	if (vm->extendedRuntimeFlags & J9_EXTENDED_RUNTIME_DEBUG_VM_ACCESS) {
@@ -250,6 +260,11 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 
 #if defined(J9VM_INTERP_ATOMIC_FREE_JNI_USES_FLUSH)
 			flushProcessWriteBuffers(vm);
+			/* DIAG-XACCESS-POSTFLUSH: race window just closed, Pass 2 starts now */
+			fprintf(stderr,
+				"[XACCESS-POSTFLUSH] thread=%p — Pass 2 starting\n",
+				(void *)vmThread);
+			fflush(stderr);
 #endif /* J9VM_INTERP_ATOMIC_FREE_JNI_USES_FLUSH */
 
 			Assert_VM_true(0 == vm->exclusiveAccessResponseCount);
@@ -258,6 +273,17 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 			currentThread = vmThread;
 			while ((currentThread = currentThread->linkNext) != vmThread) {
 				omrthread_monitor_enter(currentThread->publicFlagsMutex);
+
+				/* DIAG-XACCESS-SCAN2: per-thread observation */
+				fprintf(stderr,
+					"[XACCESS-SCAN2] requester=%p target=%p inNative=%d publicFlags=0x%zx privateFlags=0x%zx\n",
+					(void *)vmThread,
+					(void *)currentThread,
+					(int)currentThread->inNative,
+					(size_t)currentThread->publicFlags,
+					(size_t)currentThread->privateFlags);
+				fflush(stderr);
+
 #if !defined(J9VM_INTERP_TWO_PASS_EXCLUSIVE)
 				VM_VMAccess::setPublicFlags(currentThread, J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE, true);
 				/* Because the previous line writes atomically to the same field read below, there is likely
@@ -280,10 +306,16 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 					VM_VMAccess::setPublicFlags(currentThread, J9_PUBLIC_FLAGS_NOT_COUNTED_BY_EXCLUSIVE);
 #endif /* !J9VM_INTERP_TWO_PASS_EXCLUSIVE */
 				} else if (currentThread->publicFlags & J9_PUBLIC_FLAGS_VM_ACCESS) {
-#if defined(J9VM_INTERP_TWO_PASS_EXCLUSIVE)
+	#if defined(J9VM_INTERP_TWO_PASS_EXCLUSIVE)
 					VM_VMAccess::clearPublicFlags(currentThread, J9_PUBLIC_FLAGS_NOT_COUNTED_BY_EXCLUSIVE);
-#endif /* J9VM_INTERP_TWO_PASS_EXCLUSIVE */
+	#endif /* J9VM_INTERP_TWO_PASS_EXCLUSIVE */
 					responsesExpected++;
+					/* DIAG-XACCESS-COUNTED: this thread is a counted responder */
+					fprintf(stderr,
+						"[XACCESS-COUNTED] target=%p responsesExpected=%zu\n",
+						(void *)currentThread,
+						(size_t)responsesExpected);
+					fflush(stderr);
 				}
 #else /* J9VM_INTERP_ATOMIC_FREE_JNI */
 				if (currentThread->publicFlags & J9_PUBLIC_FLAGS_VM_ACCESS) {
@@ -303,9 +335,25 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 		omrthread_monitor_enter(vm->exclusiveAccessMutex);
 		vm->exclusiveAccessResponseCount += responsesExpected;
 		Trc_VM_acquireExclusiveVMAccess_WaitingForResponses(vmThread,vm->exclusiveAccessResponseCount);
+
+		/* DIAG-XACCESS-WAIT: entering wait loop */
+		fprintf(stderr,
+			"[XACCESS-WAIT] thread=%p responsesExpected=%zu sharedCount=%zu\n",
+			(void *)vmThread,
+			(size_t)responsesExpected,
+			(size_t)vm->exclusiveAccessResponseCount);
+		fflush(stderr);
+
 		while(vm->exclusiveAccessResponseCount) {
 			omrthread_monitor_wait(vm->exclusiveAccessMutex);
 		}
+
+		/* DIAG-XACCESS-WAIT-DONE: all threads responded, no hang */
+		fprintf(stderr,
+			"[XACCESS-WAIT-DONE] thread=%p sharedCount=%zu\n",
+			(void *)vmThread,
+			(size_t)vm->exclusiveAccessResponseCount);
+		fflush(stderr);
 
 		/*
 		 * Another thread may enter a critical region after the above HALT loop without
@@ -384,9 +432,25 @@ void   internalAcquireVMAccessNoMutexWithMask(J9VMThread * vmThread, UDATA haltM
 	}
 
 
+	/* DIAG-HALTLOOP-ENTER */
+	fprintf(stderr,
+		"[HALT-WAIT-ENTER] thread=%p publicFlags=0x%zx haltMask=0x%zx willBlock=%d\n",
+		(void *)vmThread,
+		(size_t)vmThread->publicFlags,
+		(size_t)haltMask,
+		(int)((vmThread->publicFlags & haltMask) != 0));
+	fflush(stderr);
+
 	while (vmThread->publicFlags & haltMask) {
 		omrthread_monitor_wait(vmThread->publicFlagsMutex);
 	}
+
+	/* DIAG-HALTLOOP-DONE */
+	fprintf(stderr,
+		"[HALT-WAIT-DONE] thread=%p publicFlags=0x%zx\n",
+		(void *)vmThread,
+		(size_t)vmThread->publicFlags);
+	fflush(stderr);
 
 	TRIGGER_J9HOOK_VM_ACQUIREVMACCESS(vm->hookInterface, vmThread);
 
@@ -448,8 +512,29 @@ static void  internalReleaseVMAccessNoMutexNoCheck(J9VMThread * vmThread)
 		if (J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE == (vmThread->publicFlags & (J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE | J9_PUBLIC_FLAGS_NOT_COUNTED_BY_EXCLUSIVE))) {
 			U_64 timeNow = updateExclusiveVMAccessStats(vmThread);
 
+			/* DIAG-RESPOND-1: counted responder */
+			fprintf(stderr,
+				"[RESPOND-COUNTED] thread=%p publicFlags=0x%zx countBefore=%zu\n",
+				(void *)vmThread,
+				(size_t)vmThread->publicFlags,
+				(size_t)vm->exclusiveAccessResponseCount);
+			fflush(stderr);
+
 			--vm->exclusiveAccessResponseCount;
+
+			/* DIAG-RESPOND-2: decremented */
+			fprintf(stderr,
+				"[RESPOND-DECR] thread=%p countAfter=%zu\n",
+				(void *)vmThread,
+				(size_t)vm->exclusiveAccessResponseCount);
+			fflush(stderr);
+
 			if (vm->exclusiveAccessResponseCount == 0) {
+				/* DIAG-RESPOND-LAST: last responder — waking requester */
+				fprintf(stderr,
+					"[RESPOND-LAST] thread=%p — notifying requester\n",
+					(void *)vmThread);
+				fflush(stderr);
 				VM_VMAccess::respondToExclusiveRequest(vmThread, vm, PORTLIB, timeNow, J9_EXCLUSIVE_SLOW_REASON_EXCLUSIVE);
 			}
 		}
@@ -508,6 +593,14 @@ static void clearThreadLocalCachesPostExclusive(J9VMThread *currentThread)
 void releaseExclusiveVMAccess(J9VMThread * vmThread)
 {
 	J9JavaVM* vm = vmThread->javaVM;
+
+	/* DIAG-RELEASE-XACCESS-ENTER */
+	fprintf(stderr,
+		"[RELEASE-XACCESS-ENTER] thread=%p publicFlags=0x%zx exclusiveState=%zu\n",
+		(void *)vmThread,
+		(size_t)vmThread->publicFlags,
+		(size_t)vm->exclusiveAccessState);
+	fflush(stderr);
 
 	Trc_VM_releaseExclusiveVMAccess_Entry(vmThread);
 	if (vm->extendedRuntimeFlags & J9_EXTENDED_RUNTIME_DEBUG_VM_ACCESS) {
@@ -615,6 +708,13 @@ void releaseExclusiveVMAccess(J9VMThread * vmThread)
 			/* Remove the Exclusive Access bit from the vm's exAccess state only if the queue is empty */
 			Trc_VM_releaseExclusiveVMAccess_QueueEmpty(vmThread);
 			vm->exclusiveAccessState = J9_XACCESS_NONE;
+
+			/* DIAG-RELEASE-XACCESS-NOTIFYING */
+			fprintf(stderr,
+				"[RELEASE-XACCESS-NOTIFY] thread=%p — clearing HALT on all threads\n",
+				(void *)vmThread);
+			fflush(stderr);
+
 			/* Make sure stale thread pointers don't exist in the stats */
 			vm->omrVM->exclusiveVMAccessStats.requester = NULL;
 			vm->omrVM->exclusiveVMAccessStats.lastResponder = NULL;
@@ -1082,12 +1182,41 @@ mustHaveVMAccess(J9VMThread * vmThread)
 void
 internalEnterVMFromJNI(J9VMThread *currentThread)
 {
+	/* DIAG-ENTER-VM-1: state BEFORE inNative changes */
+	fprintf(stderr,
+		"[ENTER-VM-BEFORE] thread=%p inNative=%d publicFlags=0x%zx\n",
+		(void *)currentThread,
+		(int)currentThread->inNative,
+		(size_t)currentThread->publicFlags);
+	fflush(stderr);
+
 	currentThread->inNative = FALSE;
 	VM_AtomicSupport::readWriteBarrier(); // necessary?
+
+	/* DIAG-ENTER-VM-2: after inNative=FALSE, BEFORE mutex — the observable race gap */
+	fprintf(stderr,
+		"[ENTER-VM-GAP] thread=%p inNative=%d publicFlags=0x%zx haltExcl=%d\n",
+		(void *)currentThread,
+		(int)currentThread->inNative,
+		(size_t)currentThread->publicFlags,
+		(int)((currentThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) != 0));
+	fflush(stderr);
+
 	if (J9_UNEXPECTED(currentThread->publicFlags != J9_PUBLIC_FLAGS_VM_ACCESS)) {
 		omrthread_monitor_t const publicFlagsMutex = currentThread->publicFlagsMutex;
 		omrthread_t const osThread = currentThread->osThread;
 		omrthread_monitor_enter_using_threadId(publicFlagsMutex, osThread);
+
+		/* DIAG-ENTER-VM-3: inside mutex */
+		fprintf(stderr,
+			"[ENTER-VM-MUTEX] thread=%p inNative=%d publicFlags=0x%zx haltExcl=%d notCounted=%d\n",
+			(void *)currentThread,
+			(int)currentThread->inNative,
+			(size_t)currentThread->publicFlags,
+			(int)((currentThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) != 0),
+			(int)((currentThread->publicFlags & J9_PUBLIC_FLAGS_NOT_COUNTED_BY_EXCLUSIVE) != 0));
+		fflush(stderr);
+
 		/* If VM access acquire is being forced out-of-line, do the release to force a new
 		 * acquire (e.g. for concurrent scavenger).
 		 */
@@ -1097,10 +1226,34 @@ internalEnterVMFromJNI(J9VMThread *currentThread)
 			}
 		}
 		if (!J9_ARE_ANY_BITS_SET(currentThread->publicFlags, J9_PUBLIC_FLAGS_VM_ACCESS)) {
+
+			/* DIAG-ENTER-VM-4: about to block acquiring VM access */
+			fprintf(stderr,
+				"[ENTER-VM-ACQUIRE] thread=%p publicFlags=0x%zx haltExcl=%d\n",
+				(void *)currentThread,
+				(size_t)currentThread->publicFlags,
+				(int)((currentThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) != 0));
+			fflush(stderr);
+
 			internalAcquireVMAccessNoMutex(currentThread);
+
+			/* DIAG-ENTER-VM-5: returned from acquire — halt wait complete */
+			fprintf(stderr,
+				"[ENTER-VM-ACQUIRED] thread=%p publicFlags=0x%zx\n",
+				(void *)currentThread,
+				(size_t)currentThread->publicFlags);
+			fflush(stderr);
 		}
 		omrthread_monitor_exit_using_threadId(publicFlagsMutex, osThread);
 	}
+
+	/* DIAG-ENTER-VM-6: transition fully complete */
+	fprintf(stderr,
+		"[ENTER-VM-DONE] thread=%p inNative=%d publicFlags=0x%zx\n",
+		(void *)currentThread,
+		(int)currentThread->inNative,
+		(size_t)currentThread->publicFlags);
+	fflush(stderr);
 }
 
 void
