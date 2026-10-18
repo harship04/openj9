@@ -360,10 +360,6 @@ freeClassLoader(J9ClassLoader *classLoader, J9JavaVM *javaVM, J9VMThread *vmThre
 		pool_state sharedLibrariesWalkState;
 		J9NativeLibrary* nativeLibrary = pool_startDo(classLoader->sharedLibraries, &sharedLibrariesWalkState);
 
-		if (NULL != nativeLibrary) {
-			Assert_VM_mustHaveVMAccess(vmThread);
-		}
-
 		while (NULL != nativeLibrary) {
 			BOOLEAN unloadPerformed = FALSE;
 
@@ -373,6 +369,7 @@ freeClassLoader(J9ClassLoader *classLoader, J9JavaVM *javaVM, J9VMThread *vmThre
 				 *			buildSpecialStackFrame: J9SFJNINativeMethodFrame forThread: aVMThread flags: 0 visible: false;
 				 *			push: nil "method"
 				 */
+				Assert_VM_mustHaveVMAccess(vmThread);
 				pushEventFrame(vmThread, TRUE, 0);
 			}
 

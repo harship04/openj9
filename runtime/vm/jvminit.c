@@ -553,17 +553,6 @@ exitJavaVM(J9VMThread * vmThread, IDATA rc)
 			omrthread_monitor_exit(vm->runtimeFlagsMutex);
 		}
 
-		/* DIAG-EXIT-1: shutdown sequence started */
-		fprintf(stderr,
-			"[EXIT-VM-START] thread=%p publicFlags=0x%zx inNative=%d exclusiveAccessState=%zu totalThreadCount=%zu anonClassCount=%zu\n",
-			(void *)vmThread,
-			(size_t)vmThread->publicFlags,
-			(int)vmThread->inNative,
-			(size_t)vm->exclusiveAccessState,
-			(size_t)vm->totalThreadCount,
-			(size_t)vm->anonClassCount);
-		fflush(stderr);
-
 #ifdef J9VM_OPT_SIDECAR
 		if (vm->sidecarExitHook)
 			(*(vm->sidecarExitHook))(vm);
@@ -595,22 +584,8 @@ exitJavaVM(J9VMThread * vmThread, IDATA rc)
 		 * acquire it if another thread already has it.
 		 */
 		if (J9_XACCESS_NONE == vm->exclusiveAccessState) {
-			/* DIAG-EXIT-2: about to acquire exclusive VM access for shutdown */
-			fprintf(stderr,
-				"[EXIT-VM-XACCESS] thread=%p exclusiveAccessState=%zu\n",
-				(void *)vmThread,
-				(size_t)vm->exclusiveAccessState);
-			fflush(stderr);
-
 			internalAcquireVMAccess(vmThread);
 			acquireExclusiveVMAccess(vmThread);
-
-			/* DIAG-EXIT-3: exclusive access acquired — shutdown proceeding normally (no hang) */
-			fprintf(stderr,
-				"[EXIT-VM-XACCESS-DONE] thread=%p exclusiveAccessState=%zu\n",
-				(void *)vmThread,
-				(size_t)vm->exclusiveAccessState);
-			fflush(stderr);
 		}
 
 #if defined(WIN32)

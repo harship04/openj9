@@ -20,7 +20,6 @@
  * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0 OR GPL-2.0-only WITH OpenJDK-assembly-exception-1.0
  *******************************************************************************/
 
-#include <stdio.h>
 #include <stdlib.h>
 #include "j9.h"
 #include "j9protos.h"
@@ -2864,25 +2863,7 @@ fail:
 	/* Now that all required classes are loaded, reacquire the classTableMutex and see if the new class has appeared in the table.
 	 * If so, return that one.  If not, create the new class and put it in the class table.
 	 */
-
-	/* DIAG-CLASSTABLE-BEFORE: worker about to block on classTableMutex */
-	fprintf(stderr,
-		"[CLASSTABLE-ENTER-BEFORE] thread=%p monitor=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(void *)javaVM->classTableMutex,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
-
 	omrthread_monitor_enter(javaVM->classTableMutex);
-
-	/* DIAG-CLASSTABLE-AFTER: acquired classTableMutex */
-	fprintf(stderr,
-		"[CLASSTABLE-ENTER-AFTER] thread=%p monitor=%p publicFlags=0x%zx\n",
-		(void *)vmThread,
-		(void *)javaVM->classTableMutex,
-		(size_t)vmThread->publicFlags);
-	fflush(stderr);
 
 	UDATA packageID = 0;
 	if (fastHCR) {

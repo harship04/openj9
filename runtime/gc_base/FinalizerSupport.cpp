@@ -20,7 +20,6 @@
  * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0 OR GPL-2.0-only WITH OpenJDK-assembly-exception-1.0
  *******************************************************************************/
 
-#include <stdio.h>
 #include "j9.h"
 #include "j9accessbarrier.h"
 #include "j9cfg.h"
@@ -372,23 +371,7 @@ process_finalizable(J9VMThread *vmThread, j9object_t object, jclass j9VMInternal
 
 	((JNIEnv *)vmThread)->DeleteLocalRef(localRef);
 
-	/* DIAG-PROC-FINAL-BEFORE-ENTER */
-	fprintf(stderr,
-		"[PROC-FINAL-BEFORE-ENTER] thread=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
-
 	fns->internalEnterVMFromJNI(vmThread);
-
-	/* DIAG-PROC-FINAL-AFTER-ENTER */
-	fprintf(stderr,
-		"[PROC-FINAL-AFTER-ENTER] thread=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
 }
 
 static void
@@ -429,73 +412,12 @@ process_classloader(J9VMThread *vmThread, J9ClassLoader *classLoader)
 	vm = vmThread->javaVM;
 	fns = vm->internalVMFunctions;
 
-	/* DIAG-PROC-CL-ENTER */
-	fprintf(stderr,
-		"[PROC-CL-ENTER] thread=%p classLoader=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(void *)classLoader,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
-
 	fns->internalReleaseVMAccess(vmThread);
-
-	/* DIAG-PROC-CL-BEFORE-ENTER1: about to call first internalEnterVMFromJNI */
-	fprintf(stderr,
-		"[PROC-CL-BEFORE-ENTER1] thread=%p publicFlags=0x%zx inNative=%d classTableMutex=%p\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative,
-		(void *)vm->classTableMutex);
-	fflush(stderr);
-
-	fns->internalEnterVMFromJNI(vmThread);
-
-	/* DIAG-PROC-CL-AFTER-ENTER1 */
-	fprintf(stderr,
-		"[PROC-CL-AFTER-ENTER1] thread=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
 
 	Assert_MM_true(NULL == classLoader->classSegments);
-
-	/* DIAG-PROC-CL-BEFORE-FREE: about to call freeClassLoader (acquires classTableMutex inside) */
-	fprintf(stderr,
-		"[PROC-CL-BEFORE-FREE] thread=%p classLoader=%p\n",
-		(void *)vmThread,
-		(void *)classLoader);
-	fflush(stderr);
-
 	fns->freeClassLoader(classLoader, vm, vmThread, JNI_FALSE);
 
-	/* DIAG-PROC-CL-AFTER-FREE: freeClassLoader returned (classTableMutex released inside) */
-	fprintf(stderr,
-		"[PROC-CL-AFTER-FREE] thread=%p publicFlags=0x%zx\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags);
-	fflush(stderr);
-
-	fns->internalReleaseVMAccess(vmThread);
-
-	/* DIAG-PROC-CL-BEFORE-ENTER2: ★ second internalEnterVMFromJNI — the race site */
-	fprintf(stderr,
-		"[PROC-CL-BEFORE-ENTER2] thread=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
-
 	fns->internalEnterVMFromJNI(vmThread);
-
-	/* DIAG-PROC-CL-DONE */
-	fprintf(stderr,
-		"[PROC-CL-DONE] thread=%p publicFlags=0x%zx inNative=%d\n",
-		(void *)vmThread,
-		(size_t)vmThread->publicFlags,
-		(int)vmThread->inNative);
-	fflush(stderr);
 }
 
 static void
@@ -597,15 +519,6 @@ static int J9THREAD_PROC FinalizeWorkerThread(void *arg)
 
 		omrthread_monitor_exit(monitor);
 
-		/* DIAG-FINALIZER-WAKE: worker woke, about to enter VM for a job batch */
-		fprintf(stderr,
-			"[FINALIZER-WAKE] thread=%p publicFlags=0x%zx inNative=%d anonClassCount=%zu\n",
-			(void *)env,
-			(size_t)((J9VMThread *)env)->publicFlags,
-			(int)((J9VMThread *)env)->inNative,
-			(size_t)vm->anonClassCount);
-		fflush(stderr);
-
 		fns->internalEnterVMFromJNI(env);
 		
 #if defined(J9VM_GC_DYNAMIC_CLASS_UNLOADING)
@@ -658,13 +571,6 @@ static int J9THREAD_PROC FinalizeWorkerThread(void *arg)
 			}
 #endif /* J9VM_GC_DYNAMIC_CLASS_UNLOADING */
 
-			/* DIAG-FINALIZER-JOB: dispatching one finalize job (type 4 = classloader) */
-			fprintf(stderr,
-				"[FINALIZER-JOB] thread=%p jobType=%u\n",
-				(void *)env,
-				(unsigned int)finalizeJob->type);
-			fflush(stderr);
-
 			/* processing will release/acquire VM access */
 			process(env, finalizeJob, j9VMInternalsClass, runFinalizeMID, referenceEnqueueImplMID);
 
@@ -690,13 +596,6 @@ static int J9THREAD_PROC FinalizeWorkerThread(void *arg)
 				break;
 			}
 		} while (true);
-
-		/* DIAG-FINALIZER-BATCH-DONE: finished all jobs in this batch */
-		fprintf(stderr,
-			"[FINALIZER-BATCH-DONE] thread=%p publicFlags=0x%zx\n",
-			(void *)env,
-			(size_t)((J9VMThread *)env)->publicFlags);
-		fflush(stderr);
 
 		fns->internalReleaseVMAccess(env);
 
