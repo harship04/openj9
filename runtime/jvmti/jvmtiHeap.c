@@ -129,6 +129,9 @@ typedef struct J9JVMTIHeapData {
 
 static UDATA copyObjectTags (J9JVMTIObjectTag * entry, J9JVMTIObjectTagMatch * results);
 static UDATA countObjectTags (J9JVMTIObjectTag * entry, J9JVMTIObjectTagMatch * results);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+static UDATA copyValueTypeTags (J9JVMTIValueTypeTag * entry, J9JVMTIObjectTagMatch * results);
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 static jvmtiIterationControl iterateThroughHeapCallback(J9JavaVM * vm, J9MM_IterateObjectDescriptor *objectDesc, void * userData);
 
 static jvmtiIterationControl wrap_heapReferenceCallback(J9JavaVM * vm, J9JVMTIHeapData * iteratorData);
@@ -207,6 +210,9 @@ jvmtiGetTag(jvmtiEnv* env,
 	if (rc == JVMTI_ERROR_NONE) {
 		J9JVMTIObjectTag entry;
 		J9JVMTIObjectTag * objectTag;
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+		J9JVMTIValueTypeTag * valueTypeTag = NULL;
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 		vm->internalVMFunctions->internalEnterVMFromJNI(currentThread);
 
@@ -223,9 +229,26 @@ jvmtiGetTag(jvmtiEnv* env,
 			/* Ensure exclusive access to tag table */
 			omrthread_monitor_enter(((J9JVMTIEnv *)env)->mutex);
 
-			objectTag = hashTableFind(((J9JVMTIEnv *)env)->objectTagTable, &entry);
-			if (objectTag) {
-				rv_tag = objectTag->tag;
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+			/* Tags that FollowReferences() assigned to value type proxies are kept in
+			 * valueTypeObjectTagTable, so look there first. */
+			if ((NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable)
+				&& J9_IS_J9CLASS_VALUETYPE(J9OBJECT_CLAZZ(currentThread, entry.ref))
+			) {
+				J9JVMTIValueTypeTag valueTypeKey;
+				valueTypeKey.ref = object;
+				valueTypeKey.tag = 0;
+				valueTypeTag = hashTableFind(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, &valueTypeKey);
+			}
+			if (NULL != valueTypeTag) {
+				rv_tag = valueTypeTag->tag;
+			} else
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+			{
+				objectTag = hashTableFind(((J9JVMTIEnv *)env)->objectTagTable, &entry);
+				if (objectTag) {
+					rv_tag = objectTag->tag;
+				}
 			}
 
 			omrthread_monitor_exit(((J9JVMTIEnv *)env)->mutex);
@@ -260,6 +283,10 @@ jvmtiSetTag(jvmtiEnv* env,
 	if (rc == JVMTI_ERROR_NONE) {
 		J9JVMTIObjectTag entry;
 		J9JVMTIObjectTag * objectTag;
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+		J9JVMTIValueTypeTag valueTypeKey;
+		J9JVMTIValueTypeTag * valueTypeTag = NULL;
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 		vm->internalVMFunctions->internalEnterVMFromJNI(currentThread);
 
@@ -276,17 +303,40 @@ jvmtiSetTag(jvmtiEnv* env,
 			/* Ensure exclusive access to tag table */
 			omrthread_monitor_enter(((J9JVMTIEnv *)env)->mutex);
 
-			objectTag = hashTableFind(((J9JVMTIEnv *)env)->objectTagTable, &entry);
-			if (objectTag) {
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+			/* If the value type already has an entry in valueTypeObjectTagTable, update or remove
+			 * that entry so the two tables never disagree. Removing an entry also deletes the
+			 * global reference the table owns. */
+			if ((NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable)
+				&& J9_IS_J9CLASS_VALUETYPE(J9OBJECT_CLAZZ(currentThread, entry.ref))
+			) {
+				valueTypeKey.ref = object;
+				valueTypeKey.tag = 0;
+				valueTypeTag = hashTableFind(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, &valueTypeKey);
+			}
+			if (NULL != valueTypeTag) {
 				if (tag) {
-					objectTag->tag = tag;
+					valueTypeTag->tag = tag;
 				} else {
-					hashTableRemove(((J9JVMTIEnv *)env)->objectTagTable, &entry);
+					jobject owned = valueTypeTag->ref;
+					hashTableRemove(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, &valueTypeKey);
+					vm->internalVMFunctions->j9jni_deleteGlobalRef((JNIEnv *)currentThread, owned, JNI_FALSE);
 				}
-			} else {
-				if (tag) {
-					if ( hashTableAdd(((J9JVMTIEnv *)env)->objectTagTable, &entry) == NULL ) {
-						rc = JVMTI_ERROR_OUT_OF_MEMORY;
+			} else
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+			{
+				objectTag = hashTableFind(((J9JVMTIEnv *)env)->objectTagTable, &entry);
+				if (objectTag) {
+					if (tag) {
+						objectTag->tag = tag;
+					} else {
+						hashTableRemove(((J9JVMTIEnv *)env)->objectTagTable, &entry);
+					}
+				} else {
+					if (tag) {
+						if ( hashTableAdd(((J9JVMTIEnv *)env)->objectTagTable, &entry) == NULL ) {
+							rc = JVMTI_ERROR_OUT_OF_MEMORY;
+						}
 					}
 				}
 			}
@@ -389,6 +439,11 @@ jvmtiGetObjectsWithTags(jvmtiEnv* env,
 		results.forLen = tag_count;
 
 		hashTableForEachDo(((J9JVMTIEnv *)env)->objectTagTable, (J9HashTableDoFn) countObjectTags, &results);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+		if (NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable) {
+			hashTableForEachDo(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, (J9HashTableDoFn) countObjectTags, &results);
+		}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 		if (object_result_ptr) {
 			results.objects = j9mem_allocate_memory(sizeof(jobject) * results.count, J9MEM_CATEGORY_JVMTI_ALLOCATE);
@@ -418,6 +473,11 @@ jvmtiGetObjectsWithTags(jvmtiEnv* env,
 			/* Fill in elements ... unwinds results.count */
 			if (object_result_ptr || tag_result_ptr) {
 				hashTableForEachDo(((J9JVMTIEnv *)env)->objectTagTable, (J9HashTableDoFn) copyObjectTags, &results);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+				if (NULL != ((J9JVMTIEnv *)env)->valueTypeObjectTagTable) {
+					hashTableForEachDo(((J9JVMTIEnv *)env)->valueTypeObjectTagTable, (J9HashTableDoFn) copyValueTypeTags, &results);
+				}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 			}
 
 		} else {
@@ -488,6 +548,37 @@ countObjectTags(J9JVMTIObjectTag * entry, J9JVMTIObjectTagMatch * results)
 
 	return 0;
 }
+
+
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+/* Like copyObjectTags, but the entry's ref is a JNI global reference that must be dereferenced. */
+static UDATA
+copyValueTypeTags(J9JVMTIValueTypeTag * entry, J9JVMTIObjectTagMatch * results)
+{
+	J9JavaVM * vm = results->vm;
+	JNIEnv * jniEnv = (JNIEnv *)results->currentThread;
+	int i;
+
+	for ( i = 0; i < results->forLen; i++ ) {
+		if ( results->forTags[i] == entry->tag ) {
+			jint slot = results->count - 1;
+
+			/* Reverse fill */
+			if (results->objects) {
+				results->objects[slot] = (jobject) vm->internalVMFunctions->j9jni_createLocalRef( jniEnv, *(j9object_t *)entry->ref );
+			}
+			if (results->tags) {
+				results->tags[slot] = entry->tag;
+			}
+			results->count = slot;
+
+			break;
+		}
+	}
+
+	return 0;
+}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 
 
@@ -2073,105 +2164,99 @@ iterateFlattenedSubValues(J9JavaVM *vm, J9JVMTIHeapData *iteratorData, j9object_
 
 #if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
 /**
- * \brief   Process all deferred flat-ref records accumulated during the GC walk.
+ * \brief   Report the flattened fields and array elements recorded during the heap walk.
  * \ingroup jvmti.heap
  *
  * @param[in] vm            JavaVM structure
- * @param[in] iteratorData  iteration structure
- * @return                  JVMTI_ITERATION_ABORT if a user callback requested abort,
+ * @param[in] iteratorData  iteration structure, flatRefs and flatRefCount hold the records
+ * @return                  JVMTI_ITERATION_ABORT if the user callback requested abort or a
+ *                          failure occurred, in which case iteratorData->rc is set for failures.
  *                          JVMTI_ITERATION_CONTINUE otherwise
  *
- * Called from jvmtiFollowReferences after j9gc_ext_reachable_objects_do returns,
- * when Java heap allocation is permitted again. For each record, allocates a proxy object,
- * looks up its existing tag via value-based equality, fires
- * heap_reference_callback, and persists any tag change via updateObjectTag.
+ * Called after the GC walk returns, because allocating the proxies is not permitted during it.
+ * For each record a proxy holding a copy of the flattened value is allocated, its tag is looked
+ * up in valueTypeObjectTagTable by value so that an earlier call's tag is found, and
+ * heap_reference_callback is invoked. Any tag change is written back to the table.
+ *
+ * A proxy is held by a JNI local reference while in use. A table entry owns a separate global
+ * reference, created when the proxy is first tagged and deleted when its tag is cleared.
  */
 static jvmtiIterationControl
 processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 {
 	PORT_ACCESS_FROM_JAVAVM(vm);
 	J9VMThread *vmThread = iteratorData->currentThread;
-	UDATA i;
+	J9InternalVMFunctions *vmFuncs = vm->internalVMFunctions;
+	JNIEnv *jniEnv = (JNIEnv *)vmThread;
+	J9HashTable *vtTable = iteratorData->env->valueTypeObjectTagTable;
 	jvmtiIterationControl rc = JVMTI_ITERATION_CONTINUE;
-	j9object_t *proxies;
+	jobject *proxyRefs; /* local refs, kept alive and updated by the GC */
+	UDATA i;
 
 	if (0 == iteratorData->flatRefCount) {
 		return JVMTI_ITERATION_CONTINUE;
 	}
-
-	/* Side array: proxies[i] = the proxy allocated for flatRefs[i].
-	 * Indexed by record position so nested records can look up their parent proxy. */
-	proxies = (j9object_t *)j9mem_allocate_memory(
-	    iteratorData->flatRefCount * sizeof(j9object_t), OMRMEM_CATEGORY_VM);
-	if (NULL == proxies) {
+	proxyRefs = (jobject *)j9mem_allocate_memory(iteratorData->flatRefCount * sizeof(jobject), OMRMEM_CATEGORY_VM);
+	if (NULL == proxyRefs) {
 		iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
 		return JVMTI_ITERATION_ABORT;
 	}
-	memset(proxies, 0, iteratorData->flatRefCount * sizeof(j9object_t));
+	memset(proxyRefs, 0, iteratorData->flatRefCount * sizeof(jobject));
 
 	for (i = 0; i < iteratorData->flatRefCount; i++) {
 		J9JVMTIFlatRefRecord *rec = &iteratorData->flatRefs[i];
 		j9object_t proxy = NULL;
-		J9JVMTIObjectTag search;
-		J9JVMTIObjectTag *existing;
+		j9object_t src = (rec->parentIdx >= 0) ? *(j9object_t *)proxyRefs[rec->parentIdx] : rec->srcObject;
+		J9JVMTIValueTypeTag key;
+		J9JVMTIValueTypeTag *existing;
 		jlong tagBefore;
 		jlong tag;
-		jlong referrerClassTag;
 		jlong referrerObjTag;
 		jvmtiHeapReferenceInfo refInfo;
 		jint visitRc;
 
 		if (JVMTI_HEAP_REFERENCE_ARRAY_ELEMENT == rec->refKind) {
-			proxy = vm->internalVMFunctions->loadFlattenableArrayElement(
+			proxy = vmFuncs->loadFlattenableArrayElement(
 			            vmThread, rec->srcObject, (U_32)rec->fieldOffset, TRUE);
 			if (NULL == proxy) {
-				proxy = vm->internalVMFunctions->loadFlattenableArrayElement(
+				proxy = vmFuncs->loadFlattenableArrayElement(
 				            vmThread, rec->srcObject, (U_32)rec->fieldOffset, FALSE);
 			}
-		} else if (rec->parentIdx < 0) {
-			/* Top-level instance field: src is the original containing heap object */
-			proxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
-			            vmThread, rec->flatClass, rec->srcObject,
-			            rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
-			if (NULL == proxy) {
-				proxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
-				            vmThread, rec->flatClass, rec->srcObject,
-				            rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), FALSE);
-			}
 		} else {
-			/* Nested sub-value: src is the parent's already-allocated proxy */
-			j9object_t parentProxy = proxies[rec->parentIdx];
-			proxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
-			            vmThread, rec->flatClass, parentProxy,
-			            rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), TRUE);
+			UDATA off = rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm);
+			proxy = vmFuncs->getFlattenedInstanceFieldAtOffset(
+			            vmThread, rec->flatClass, src, off, TRUE);
 			if (NULL == proxy) {
-				proxy = vm->internalVMFunctions->getFlattenedInstanceFieldAtOffset(
-				            vmThread, rec->flatClass, parentProxy,
-				            rec->fieldOffset + J9JAVAVM_OBJECT_HEADER_SIZE(vm), FALSE);
+				/* The fast path failed. Re-read src, since the slow path may GC and move objects.
+				 * A parent proxy is re-read through its local reference, which the GC updates. */
+				src = (rec->parentIdx >= 0) ? *(j9object_t *)proxyRefs[rec->parentIdx] : rec->srcObject;
+				proxy = vmFuncs->getFlattenedInstanceFieldAtOffset(
+				            vmThread, rec->flatClass, src, off, FALSE);
 			}
 		}
-
 		if (NULL == proxy) {
 			iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
 			rc = JVMTI_ITERATION_ABORT;
 			goto done;
 		}
-		proxies[i] = proxy;
+		proxyRefs[i] = vmFuncs->j9jni_createLocalRef(jniEnv, proxy);
 
-		/* Search existing tag in objectTagTable */
-		search.ref = proxy;
-		existing   = hashTableFind(iteratorData->env->objectTagTable, &search);
-		tagBefore  = (NULL == existing) ? 0 : existing->tag;
-		tag        = tagBefore;
+		/* Look up a tag assigned by an earlier call. The key holds the proxy's local reference,
+		 * which the table's hash and equality functions dereference. */
+		key.ref = proxyRefs[i];
+		key.tag = 0;
+		existing = (J9JVMTIValueTypeTag *)hashTableFind(vtTable, &key);
+		tagBefore = (NULL == existing) ? 0 : existing->tag;
+		tag = tagBefore;
 
-		referrerClassTag = rec->referrerClassTag;
 		if (rec->parentIdx < 0) {
 			referrerObjTag = rec->referrerObjTag;
 		} else {
-			J9JVMTIObjectTag parentSearch;
-			J9JVMTIObjectTag *parentEntry;
-			parentSearch.ref = proxies[rec->parentIdx];
-			parentEntry = hashTableFind(iteratorData->env->objectTagTable, &parentSearch);
+			J9JVMTIValueTypeTag parentKey;
+			J9JVMTIValueTypeTag *parentEntry;
+			parentKey.ref = proxyRefs[rec->parentIdx];
+			parentKey.tag = 0;
+			parentEntry = (J9JVMTIValueTypeTag *)hashTableFind(vtTable, &parentKey);
 			referrerObjTag = (NULL == parentEntry) ? 0 : parentEntry->tag;
 		}
 
@@ -2184,14 +2269,43 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 		visitRc = iteratorData->callbacks->heap_reference_callback(
 		              rec->refKind, &refInfo,
 		              rec->classTag,
-		              referrerClassTag,
+		              rec->referrerClassTag,
 		              rec->objSize,
 		              &tag,
 		              &referrerObjTag,
 		              -1,
 		              iteratorData->userData);
 
-		updateObjectTag(iteratorData, proxy, &tagBefore, tag);
+		/* The callback may modify the table, so look the entry up again before changing it. */
+		if (0 != tagBefore) {
+			if (0 != tag) {
+				if (tagBefore != tag) {
+					existing = (J9JVMTIValueTypeTag *)hashTableFind(vtTable, &key);
+					if (NULL != existing) {
+						existing->tag = tag;
+					}
+				}
+			} else {
+				existing = (J9JVMTIValueTypeTag *)hashTableFind(vtTable, &key);
+				if (NULL != existing) {
+					jobject owned = existing->ref;
+					hashTableRemove(vtTable, &key);
+					vmFuncs->j9jni_deleteGlobalRef(jniEnv, owned, JNI_FALSE);
+				}
+			}
+		} else if (0 != tag) {
+			J9JVMTIValueTypeTag newEntry;
+			newEntry.ref = vmFuncs->j9jni_createGlobalRef(jniEnv, *(j9object_t *)proxyRefs[i], JNI_FALSE);
+			newEntry.tag = tag;
+			if ((NULL == newEntry.ref) || (NULL == hashTableAdd(vtTable, &newEntry))) {
+				if (NULL != newEntry.ref) {
+					vmFuncs->j9jni_deleteGlobalRef(jniEnv, newEntry.ref, JNI_FALSE);
+				}
+				iteratorData->rc = JVMTI_ERROR_OUT_OF_MEMORY;
+				rc = JVMTI_ITERATION_ABORT;
+				goto done;
+			}
+		}
 
 		if (visitRc & JVMTI_VISIT_ABORT) {
 			rc = JVMTI_ITERATION_ABORT;
@@ -2200,7 +2314,12 @@ processFlatRefs(J9JavaVM *vm, J9JVMTIHeapData *iteratorData)
 	}
 
 done:
-	j9mem_free_memory(proxies);
+	for (i = 0; i < iteratorData->flatRefCount; i++) {
+		if (NULL != proxyRefs[i]) {
+			vmFuncs->j9jni_deleteLocalRef(jniEnv, proxyRefs[i]);
+		}
+	}
+	j9mem_free_memory(proxyRefs);
 	return rc;
 }
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */

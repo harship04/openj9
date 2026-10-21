@@ -100,6 +100,17 @@ typedef struct J9JVMTIObjectTag {
 	jlong tag;
 } J9JVMTIObjectTag;
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+/* Stores the tag of a proxy object created by FollowReferences for a flattened value.
+ * The global reference keeps the proxy alive and tracks it if the GC moves it.
+ * JVMTI code is responsible for removing entries and deleting their references.
+ * The tag member must stay at the same offset as in J9JVMTIObjectTag, countObjectTags relies on it. */
+typedef struct J9JVMTIValueTypeTag {
+	jobject ref;
+	jlong tag;
+} J9JVMTIValueTypeTag;
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 #if defined(J9VM_OPT_VALHALLA_VALUE_TYPES)
 /* Bit 0 of ref marks an object tag entry as part of the dead-entry chain. */
 #define J9JVMTI_OBJECT_TAG_DEAD_ENTRY_BIT ((UDATA)1)
@@ -179,6 +190,12 @@ typedef struct J9JVMTIEnv {
 	omrthread_monitor_t threadDataPoolMutex;
 	J9Pool *threadDataPool;
 	J9HashTable *objectTagTable;
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+	/* Stores tags for value type proxy objects. Unlike objectTagTable, entries are not
+	 * managed by the GC and must be removed by JVMTI code. */
+	J9HashTable *valueTypeObjectTagTable;
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 	J9JVMTIEventEnableMap globalEventEnable;
 	J9HashTable *watchedClasses;
 	J9Pool *breakpoints;

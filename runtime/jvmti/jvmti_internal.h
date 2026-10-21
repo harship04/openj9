@@ -1063,6 +1063,17 @@ deleteAgentBreakpoint(J9VMThread * currentThread, J9JVMTIEnv * j9env, J9JVMTIAge
 void
 disposeEnvironment(J9JVMTIEnv * j9env, UDATA freeData);
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+/**
+* @brief Delete the JNI global reference of every entry in j9env->valueTypeObjectTagTable.
+* Requires VM access. The caller must then free or recreate the table.
+* @param j9env
+* @return void
+*/
+void
+releaseValueTypeTagRefs(J9JVMTIEnv * j9env);
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 
 /**
 * @brief

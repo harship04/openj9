@@ -98,6 +98,10 @@ static void clearGlobalBreakpoint (J9VMThread * currentThread, J9JVMTIGlobalBrea
 static jvmtiError setGlobalBreakpoint (J9VMThread * currentThread, J9Method * ramMethod, IDATA location, J9JVMTIGlobalBreakpoint ** globalBreakpointPtr);
 static jvmtiError createSingleBreakpoint (J9VMThread * currentThread, J9Method * ramMethod, IDATA location, J9JVMTIGlobalBreakpoint ** globalBreakpointPtr);
 static UDATA hashObjectTag (void *entry, void *userData);
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+static UDATA hashValueTypeTag (void *entry, void *userData);
+static UDATA hashEqualValueTypeTag (void *lhsEntry, void *rhsEntry, void *userData);
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 static void deleteBreakpointedMethodReference (J9VMThread * currentThread, J9JVMTIBreakpointedMethod * breakpointedMethod);
 static UDATA fixBytecodesFrameIterator (J9VMThread * currentThread, J9StackWalkState * walkState);
 static void fixBytecodesInAllStacks (J9VMThread *currentThread, J9Method * method, UDATA delta);
@@ -230,6 +234,14 @@ disposeEnvironment(J9JVMTIEnv * j9env, UDATA freeData)
 			j9env->objectTagTable = NULL;
 		}
 
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+		if (NULL != j9env->valueTypeObjectTagTable) {
+			releaseValueTypeTagRefs(j9env);
+			hashTableFree(j9env->valueTypeObjectTagTable);
+			j9env->valueTypeObjectTagTable = NULL;
+		}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
+
 		if (NULL != j9env->watchedClasses) {
 			J9HashTableState walkState;
 			J9JVMTIWatchedClass *watchedClass = (J9JVMTIWatchedClass*)hashTableStartDo(j9env->watchedClasses, &walkState);
@@ -333,6 +345,12 @@ allocateEnvironment(J9InvocationJavaVM * invocationJavaVM, jint version, void **
 			if (j9env->objectTagTable == NULL) {
 				goto fail;
 			}
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+			j9env->valueTypeObjectTagTable = hashTableNew(OMRPORT_FROM_J9PORT(vm->portLibrary), J9_GET_CALLSITE(), 0, sizeof(J9JVMTIValueTypeTag), sizeof(jlong), 0, J9MEM_CATEGORY_JVMTI, hashValueTypeTag, hashEqualValueTypeTag, NULL, vm);
+			if (NULL == j9env->valueTypeObjectTagTable) {
+				goto fail;
+			}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 			j9env->watchedClasses = hashTableNew(OMRPORT_FROM_J9PORT(vm->portLibrary), J9_GET_CALLSITE(), 0, sizeof(J9JVMTIWatchedClass), sizeof(UDATA), 0, J9MEM_CATEGORY_JVMTI, watchedClassHash, watchedClassEqual, NULL, NULL);
 			if (j9env->watchedClasses == NULL) {
 				goto fail;
@@ -993,6 +1011,51 @@ hashEqualObjectTag(void *lhsEntry, void *rhsEntry, void *userData)
 
 	return 0;
 }
+
+
+#if defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
+/* Hash and equality for valueTypeObjectTagTable. Entries hold JNI references, so these
+ * dereference them, which needs VM access, and defer to the objectTagTable functions. Those
+ * compare value types by content only when J9VM_OPT_VALHALLA_VALUE_TYPES is defined. */
+static UDATA
+hashValueTypeTag(void *entry, void *userData)
+{
+	J9JVMTIObjectTag tmp;
+	tmp.ref = *(j9object_t *)((J9JVMTIValueTypeTag *)entry)->ref;
+	tmp.tag = 0;
+	return hashObjectTag(&tmp, userData);
+}
+
+
+static UDATA
+hashEqualValueTypeTag(void *lhsEntry, void *rhsEntry, void *userData)
+{
+	J9JVMTIObjectTag lhs;
+	J9JVMTIObjectTag rhs;
+	lhs.ref = *(j9object_t *)((J9JVMTIValueTypeTag *)lhsEntry)->ref;
+	rhs.ref = *(j9object_t *)((J9JVMTIValueTypeTag *)rhsEntry)->ref;
+	lhs.tag = rhs.tag = 0;
+	return hashEqualObjectTag(&lhs, &rhs, userData);
+}
+
+
+/* Deletes the global reference of every entry. The table itself is not modified.
+ * Requires VM access. Does nothing if there is no current VM thread. */
+void
+releaseValueTypeTagRefs(J9JVMTIEnv *j9env)
+{
+	J9JavaVM *vm = j9env->vm;
+	J9VMThread *currentThread = vm->internalVMFunctions->currentVMThread(vm);
+	if ((NULL != j9env->valueTypeObjectTagTable) && (NULL != currentThread)) {
+		J9HashTableState state;
+		J9JVMTIValueTypeTag *e = (J9JVMTIValueTypeTag *)hashTableStartDo(j9env->valueTypeObjectTagTable, &state);
+		while (NULL != e) {
+			vm->internalVMFunctions->j9jni_deleteGlobalRef((JNIEnv *)currentThread, e->ref, JNI_FALSE);
+			e = (J9JVMTIValueTypeTag *)hashTableNextDo(&state);
+		}
+	}
+}
+#endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 
 
 static UDATA
