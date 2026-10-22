@@ -908,6 +908,26 @@ MM_RootScanner::doValueTypeObjectTagSlot(J9Object **slotPtr)
 }
 
 /**
+ * Check if any active JVMTI environment has a non-empty valueTypeObjectTagTable.
+ */
+bool
+MM_RootScanner::hasValueTypeObjectTags()
+{
+	J9JVMTIData *jvmtiData = J9JVMTI_DATA_FROM_VM(_javaVM);
+	if (NULL != jvmtiData) {
+		J9JVMTIEnv *jvmtiEnv = NULL;
+		GC_JVMTIObjectTagTableListIterator envList(jvmtiData->environments);
+		while (NULL != (jvmtiEnv = (J9JVMTIEnv *)envList.nextSlot())) {
+			if ((NULL != jvmtiEnv->valueTypeObjectTagTable)
+			    && (hashTableGetCount(jvmtiEnv->valueTypeObjectTagTable) > 0)) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+/**
  * Walk every proxy object stored in the JVMTI valueTypeObjectTagTable
  * and tell the GC to keep it alive (or update its address if it moved).
  *
@@ -1007,8 +1027,9 @@ MM_RootScanner::scanRoots(MM_EnvironmentBase *env)
 	scanJNIGlobalReferences(env);
 
 #if defined(J9VM_OPT_JVMTI) && defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES)
-	/* Scan value-type proxy table as hard roots so proxies survive GC and retain their tags. */
-	if (_includeJVMTIObjectTagTables) {
+	/* Scan value-type proxy table as hard roots only when tags are present,
+	 * avoiding empty work unit scheduling on normal GC pauses. */
+	if (_includeJVMTIObjectTagTables && hasValueTypeObjectTags()) {
 		scanValueTypeObjectTagTables(env);
 	}
 #endif /* J9VM_OPT_JVMTI && J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES */

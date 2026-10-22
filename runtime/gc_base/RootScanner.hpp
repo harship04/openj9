@@ -552,6 +552,13 @@ public:
 	 * @param env  the GC environment for the current thread
 	 */
 	void scanValueTypeObjectTagTables(MM_EnvironmentBase *env);
+	/**
+	 * Check if any active JVMTI environment has a non-empty valueTypeObjectTagTable.
+	 * Used as a fast-path check to avoid scheduling empty GC work units.
+	 *
+	 * @return true if at least one table contains entries, false otherwise
+	 */
+	bool hasValueTypeObjectTags();
 #endif /* defined(J9VM_OPT_VALHALLA_FLATTENABLE_VALUE_TYPES) */
 #endif /* J9VM_OPT_JVMTI */
 
