@@ -357,11 +357,7 @@ process_finalizable(J9VMThread *vmThread, j9object_t object, jclass j9VMInternal
 
 	jobject localRef = fns->j9jni_createLocalRef((JNIEnv *)vmThread, object);
 
-	fprintf(stderr, "[FINALIZABLE-PRE-RELEASE] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 	fns->internalReleaseVMAccess(vmThread);
-	fprintf(stderr, "[FINALIZABLE-IN-WINDOW] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 
 	if((NULL != j9VMInternalsClass) && (NULL != runFinalizeMID)) {
 #if defined(J9VM_PORT_ZOS_CEEHDLRSUPPORT)
@@ -376,11 +372,17 @@ process_finalizable(J9VMThread *vmThread, j9object_t object, jclass j9VMInternal
 
 	((JNIEnv *)vmThread)->DeleteLocalRef(localRef);
 
-	fprintf(stderr, "[FINALIZABLE-PRE-ENTER] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
+	/* Diagnostic: only log when HALT_THREAD_EXCLUSIVE is set — that is the hang condition.
+	 * Under J9VM_INTERP_ATOMIC_FREE_JNI the scanner skips threads with publicFlags=0 AND
+	 * inNative=0, so exclusive can be declared complete while this thread is still in the
+	 * window above.  When that happens, internalEnterVMFromJNI will block forever on the
+	 * halt bit that was posted but not counted. */
+	if (vmThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) {
+		fprintf(stderr, "[FINALIZABLE-HANG] vmThread=%p publicFlags=%zx inNative=%d exclusiveAccessState=%zx\n",
+			vmThread, (size_t)vmThread->publicFlags, vmThread->inNative,
+			(size_t)vm->exclusiveAccessState); fflush(stderr);
+	}
 	fns->internalEnterVMFromJNI(vmThread);
-	fprintf(stderr, "[FINALIZABLE-POST-ENTER] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 }
 
 static void
@@ -394,11 +396,7 @@ process_reference(J9VMThread *vmThread, j9object_t reference, jmethodID refMID)
 
 	jobject localRef = fns->j9jni_createLocalRef((JNIEnv *)vmThread, reference);
 
-	fprintf(stderr, "[REFERENCE-PRE-RELEASE] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 	fns->internalReleaseVMAccess(vmThread);
-	fprintf(stderr, "[REFERENCE-IN-WINDOW] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 
 	if (refMID) {
 #if defined(J9VM_PORT_ZOS_CEEHDLRSUPPORT)
@@ -413,11 +411,13 @@ process_reference(J9VMThread *vmThread, j9object_t reference, jmethodID refMID)
 
 	((JNIEnv *)vmThread)->DeleteLocalRef(localRef);
 
-	fprintf(stderr, "[REFERENCE-PRE-ENTER] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
+	/* Diagnostic: same race as process_finalizable — log only on hang condition. */
+	if (vmThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) {
+		fprintf(stderr, "[REFERENCE-HANG] vmThread=%p publicFlags=%zx inNative=%d exclusiveAccessState=%zx\n",
+			vmThread, (size_t)vmThread->publicFlags, vmThread->inNative,
+			(size_t)vm->exclusiveAccessState); fflush(stderr);
+	}
 	fns->internalEnterVMFromJNI(vmThread);
-	fprintf(stderr, "[REFERENCE-POST-ENTER] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 }
 
 static void
@@ -429,26 +429,28 @@ process_classloader(J9VMThread *vmThread, J9ClassLoader *classLoader)
 	vm = vmThread->javaVM;
 	fns = vm->internalVMFunctions;
 
-	fprintf(stderr, "[CLASSLOADER-ENTER] vmThread=%p publicFlags=%zx inNative=%d classLoader=%p\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative, classLoader); fflush(stderr);
 	fns->internalReleaseVMAccess(vmThread);
-	fprintf(stderr, "[CLASSLOADER-WINDOW-1] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
+
+	/* Diagnostic: window-1 hang check (before freeClassLoader). */
+	if (vmThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) {
+		fprintf(stderr, "[CLASSLOADER-HANG-WINDOW-1] vmThread=%p publicFlags=%zx inNative=%d exclusiveAccessState=%zx\n",
+			vmThread, (size_t)vmThread->publicFlags, vmThread->inNative,
+			(size_t)vm->exclusiveAccessState); fflush(stderr);
+	}
 
 	fns->internalEnterVMFromJNI(vmThread);
-	fprintf(stderr, "[CLASSLOADER-PRE-FREE] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 	Assert_MM_true(NULL == classLoader->classSegments);
 	fns->freeClassLoader(classLoader, vm, vmThread, JNI_FALSE);
-	fprintf(stderr, "[CLASSLOADER-POST-FREE] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 	fns->internalReleaseVMAccess(vmThread);
-	fprintf(stderr, "[CLASSLOADER-WINDOW-2] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
+
+	/* Diagnostic: window-2 hang check (after freeClassLoader). */
+	if (vmThread->publicFlags & J9_PUBLIC_FLAGS_HALT_THREAD_EXCLUSIVE) {
+		fprintf(stderr, "[CLASSLOADER-HANG-WINDOW-2] vmThread=%p publicFlags=%zx inNative=%d exclusiveAccessState=%zx\n",
+			vmThread, (size_t)vmThread->publicFlags, vmThread->inNative,
+			(size_t)vm->exclusiveAccessState); fflush(stderr);
+	}
 
 	fns->internalEnterVMFromJNI(vmThread);
-	fprintf(stderr, "[CLASSLOADER-DONE] vmThread=%p publicFlags=%zx inNative=%d\n",
-		vmThread, (size_t)vmThread->publicFlags, vmThread->inNative); fflush(stderr);
 }
 
 static void
