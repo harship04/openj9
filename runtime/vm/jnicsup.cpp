@@ -34,6 +34,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include "j9port.h"
 #include "jnicsup.h"
 #include "jnicimap.h"
@@ -2393,9 +2394,19 @@ jniIsInternalClassRef(J9JavaVM *vm, jobject ref)
 {
 	UDATA rc = FALSE;
 	J9ClassWalkState classWalkState;
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): measure mutex wait and scan time (microseconds) */
+	static volatile UDATA dbgScanCalls = 0;
+	static volatile U_64 dbgTotalWaitUs = 0;
+	static volatile U_64 dbgTotalScanUs = 0;
+	static volatile U_64 dbgMaxScanUs = 0;
+	PORT_ACCESS_FROM_JAVAVM(vm);
+	U_64 tStart = j9time_hires_clock();
+	UDATA classesVisited = 0;
 	J9Class *clazz = allLiveClassesStartDo(&classWalkState, vm, NULL);
+	U_64 tLocked = j9time_hires_clock();
 	while (clazz != NULL) {
 		do {
+			classesVisited++;
 			if (ref == (jobject)&clazz->classObject) {
 				rc = TRUE;
 				goto done;
@@ -2406,6 +2417,35 @@ jniIsInternalClassRef(J9JavaVM *vm, jobject ref)
 	}
 done:
 	allLiveClassesEndDo(&classWalkState);
+	{
+		U_64 tEnd = j9time_hires_clock();
+		U_64 waitUs = j9time_hires_delta(tStart, tLocked, J9PORT_TIME_DELTA_IN_MICROSECONDS);
+		U_64 scanUs = j9time_hires_delta(tLocked, tEnd, J9PORT_TIME_DELTA_IN_MICROSECONDS);
+		UDATA n = ++dbgScanCalls;
+
+		/* counters are not atomic; approximate values are fine for diagnosis */
+		dbgTotalWaitUs += waitUs;
+		dbgTotalScanUs += scanUs;
+		if (scanUs > dbgMaxScanUs) {
+			dbgMaxScanUs = scanUs;
+		}
+		/* individual report only for very slow calls (>=100ms) so the log stays readable */
+		if ((waitUs >= 100000) || (scanUs >= 100000)) {
+			fprintf(stderr,
+				"DBG-CLSSCAN SLOW thread=%p ref=%p found=%d classesVisited=%lu waitForClassTableMutex=%llu us scanUnderMutex=%llu us\n",
+				(void *)omrthread_self(), (void *)ref, (int)rc, (unsigned long)classesVisited,
+				(unsigned long long)waitUs, (unsigned long long)scanUs);
+			fflush(stderr);
+		}
+		/* aggregate report: catches many short scans that add up */
+		if (0 == (n % 1000)) {
+			fprintf(stderr,
+				"DBG-CLSSCAN SUMMARY calls=%lu totalWait=%llu us totalScanUnderMutex=%llu us maxScan=%llu us lastClassesVisited=%lu\n",
+				(unsigned long)n, (unsigned long long)dbgTotalWaitUs, (unsigned long long)dbgTotalScanUs,
+				(unsigned long long)dbgMaxScanUs, (unsigned long)classesVisited);
+			fflush(stderr);
+		}
+	}
 	return rc;
 }
 

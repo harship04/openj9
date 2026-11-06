@@ -20,6 +20,7 @@
  * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0 OR GPL-2.0-only WITH OpenJDK-assembly-exception-1.0
  *******************************************************************************/
 
+#include <stdio.h>
 #include "j9.h"
 #include "j9consts.h"
 #include "jclprots.h"
@@ -171,7 +172,19 @@ retry:
 		}
 	}
 
-	omrthread_monitor_enter(vm->classTableMutex);
+	{
+		/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): how long do class-defining threads wait for classTableMutex? */
+		U_64 dbgWaitStart = j9time_hires_clock();
+		U_64 dbgWaitMs = 0;
+
+		omrthread_monitor_enter(vm->classTableMutex);
+		dbgWaitMs = j9time_hires_delta(dbgWaitStart, j9time_hires_clock(), J9PORT_TIME_DELTA_IN_MILLISECONDS);
+		if (dbgWaitMs >= 100) {
+			fprintf(stderr, "DBG-DEFINECLASS waited %llums for classTableMutex thread=%p\n",
+				(unsigned long long)dbgWaitMs, (void *)omrthread_self());
+			fflush(stderr);
+		}
+	}
 	/* Hidden class is never added into the hash table */
 	if ((NULL != utf8Name) && J9_ARE_NO_BITS_SET(*options, J9_FINDCLASS_FLAG_HIDDEN)) {
 		J9Class *persistedClazz = vmFuncs->hashClassTableAt(classLoader, utf8Name, utf8Length, J9_FINDCLASS_FLAG_DONT_SKIP_FROZEN_JCL_DEFINE_CLASS);

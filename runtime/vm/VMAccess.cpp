@@ -35,6 +35,7 @@
 /* #define J9VM_DBG */
 
 #include <string.h>
+#include <stdio.h>
 #include "j9.h"
 #include "j9cfg.h"
 #include "j9protos.h"
@@ -122,6 +123,9 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 	J9JavaVM* vm = vmThread->javaVM;
 	PORT_ACCESS_FROM_JAVAVM(vm);
 	J9VMThread * currentThread;
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): who waits for / holds exclusive VM access */
+	U_64 dbgAcquireStart = j9time_hires_clock();
+	UDATA dbgWasFirst = FALSE;
 
 	Trc_VM_acquireExclusiveVMAccess_Entry(vmThread);
 	if (vm->extendedRuntimeFlags & J9_EXTENDED_RUNTIME_DEBUG_VM_ACCESS) {
@@ -137,6 +141,7 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 	 * the thread already has exclusive access
 	 */
 	if ( ++(vmThread->omrVMThread->exclusiveCount) == 1 ) {
+		dbgWasFirst = TRUE;
 		/* If we have safe-point access then exclusiveCount should have already been positive. */
 		Assert_VM_true(0 == vmThread->safePointCount);
 
@@ -329,6 +334,15 @@ acquireExclusiveVMAccess(J9VMThread * vmThread)
 
 		vm->omrVM->exclusiveVMAccessStats.endTime = j9time_hires_clock();
 	}
+	if (dbgWasFirst) {
+		/* Printed for EVERY non-recursive acquire so that an ACQUIRED with no later RELEASED identifies the holder.
+		 * Note: acquireExclusiveVMAccessFromExternalThread() and safe-point access are separate paths and are not covered. */
+		U_64 waited = j9time_hires_delta(dbgAcquireStart, j9time_hires_clock(), J9PORT_TIME_DELTA_IN_MILLISECONDS);
+		fprintf(stderr, "DBG-XACCESS ACQUIRED  t=%llu vmThread=%p osThread=%p waitedForExclusive=%llums\n",
+			(unsigned long long)j9time_current_time_millis(), (void *)vmThread, (void *)vmThread->osThread,
+			(unsigned long long)waited);
+		fflush(stderr);
+	}
 	Assert_VM_true((J9_XACCESS_EXCLUSIVE == vm->exclusiveAccessState) || (J9_XACCESS_EXCLUSIVE == vm->safePointState));
 	Trc_VM_acquireExclusiveVMAccess_Exit(vmThread);
 }
@@ -508,6 +522,15 @@ static void clearThreadLocalCachesPostExclusive(J9VMThread *currentThread)
 void releaseExclusiveVMAccess(J9VMThread * vmThread)
 {
 	J9JavaVM* vm = vmThread->javaVM;
+	PORT_ACCESS_FROM_JAVAVM(vm);
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): pairs with DBG-XACCESS ACQUIRED */
+	if (1 == vmThread->omrVMThread->exclusiveCount) {
+		U_64 heldMs = j9time_hires_delta(vm->omrVM->exclusiveVMAccessStats.endTime, j9time_hires_clock(), J9PORT_TIME_DELTA_IN_MILLISECONDS);
+		fprintf(stderr, "DBG-XACCESS RELEASED  t=%llu vmThread=%p osThread=%p heldExclusive=%llums\n",
+			(unsigned long long)j9time_current_time_millis(), (void *)vmThread, (void *)vmThread->osThread,
+			(unsigned long long)heldMs);
+		fflush(stderr);
+	}
 
 	Trc_VM_releaseExclusiveVMAccess_Entry(vmThread);
 	if (vm->extendedRuntimeFlags & J9_EXTENDED_RUNTIME_DEBUG_VM_ACCESS) {
@@ -835,6 +858,9 @@ acquireExclusiveVMAccessFromExternalThread(J9JavaVM * vm)
 
 	waitForResponseFromExternalThread(vm, vmResponsesExpected, jniResponsesExpected);
 
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): external-thread (non-J9VMThread) exclusive access */
+	fprintf(stderr, "DBG-XACCESS EXTERNAL ACQUIRED osThread=%p\n", (void *)omrthread_self());
+	fflush(stderr);
 }
 
 void
@@ -848,6 +874,10 @@ releaseExclusiveVMAccessFromExternalThread(J9JavaVM * vm)
 	}
 
 	Assert_VM_true(J9_XACCESS_EXCLUSIVE == vm->exclusiveAccessState);
+
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): pairs with DBG-XACCESS EXTERNAL ACQUIRED */
+	fprintf(stderr, "DBG-XACCESS EXTERNAL RELEASED osThread=%p\n", (void *)omrthread_self());
+	fflush(stderr);
 
 	/* Acquire these monitors in the same order as in allocateVMThread to prevent deadlock */
 

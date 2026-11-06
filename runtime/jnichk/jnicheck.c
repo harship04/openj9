@@ -37,6 +37,7 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <stdarg.h>
 #include "j9port.h"
 #include "jnicheck.h"
@@ -1317,12 +1318,24 @@ static UDATA jniIsLocalRefFrameWalkFunction(J9VMThread* vmThread, J9StackWalkSta
 }
 
 
+/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): counters for how jniCheckRef resolves references */
+static volatile UDATA dbgRefTotal = 0;
+static volatile UDATA dbgRefByLocal = 0;
+static volatile UDATA dbgRefByGlobal = 0;
+static volatile UDATA dbgRefByWeak = 0;
+static volatile UDATA dbgRefFailed = 0;
+
 void
 jniCheckRef(JNIEnv* env,  const char* function, IDATA argNum, jobject reference)
 {
 	J9VMThread* vmThread = (J9VMThread*)env;
 	J9JavaVM* vm = vmThread->javaVM;
 	UDATA options = vm->checkJNIData.options;
+	PORT_ACCESS_FROM_JAVAVM(vm);
+	U_64 dbgT0 = 0;
+	U_64 dbgT1 = 0;
+	UDATA dbgStage = 0; /* 1=local/internal-class, 2=global, 3=weak, 0=none */
+	UDATA dbgCount = 0;
 
 	if (JNICHK_NONFATAL == (options & JNICHK_NONFATAL)) {
 		/* if nonfatal is specified, simply return if reference is NULL */
@@ -1331,11 +1344,38 @@ jniCheckRef(JNIEnv* env,  const char* function, IDATA argNum, jobject reference)
 		}
 	}
 
-	if (
-		jniIsLocalRef(env, env, reference)
-		|| jniIsGlobalRef(env, reference)
-		|| jniIsWeakGlobalRef(env, reference)
-	) {
+	dbgT0 = j9time_current_time_millis();
+	if (jniIsLocalRef(env, env, reference)) {
+		dbgStage = 1;
+	} else if (jniIsGlobalRef(env, reference)) {
+		dbgStage = 2;
+	} else if (jniIsWeakGlobalRef(env, reference)) {
+		dbgStage = 3;
+	}
+	dbgT1 = j9time_current_time_millis();
+	dbgCount = ++dbgRefTotal;
+	switch (dbgStage) {
+	case 1: ++dbgRefByLocal; break;
+	case 2: ++dbgRefByGlobal; break;
+	case 3: ++dbgRefByWeak; break;
+	default: ++dbgRefFailed; break;
+	}
+	/* a global ref reaching stage 2 means jniIsLocalRef already did a FULL class-table scan and found nothing */
+	if ((dbgT1 - dbgT0) >= 100) {
+		fprintf(stderr, "DBG-JNICHKREF SLOW thread=%p fn=%s arg=%ld ref=%p resolvedBy=%s took=%llums\n",
+			(void *)omrthread_self(), (NULL != function) ? function : "?", (long)argNum, (void *)reference,
+			(1 == dbgStage) ? "local/internalClass" : (2 == dbgStage) ? "GLOBAL(after full class scan)" : (3 == dbgStage) ? "weak" : "none",
+			(unsigned long long)(dbgT1 - dbgT0));
+		fflush(stderr);
+	}
+	if (0 == (dbgCount % 20000)) {
+		fprintf(stderr, "DBG-JNICHKREF SUMMARY total=%lu local/internalClass=%lu global(wasted class scan)=%lu weak=%lu failed=%lu\n",
+			(unsigned long)dbgRefTotal, (unsigned long)dbgRefByLocal, (unsigned long)dbgRefByGlobal,
+			(unsigned long)dbgRefByWeak, (unsigned long)dbgRefFailed);
+		fflush(stderr);
+	}
+
+	if (0 != dbgStage) {
 		return;
 	} else {
 		/* -1 means it's the return value rather than a parameter */

@@ -20,6 +20,7 @@
  * SPDX-License-Identifier: EPL-2.0 OR Apache-2.0 OR GPL-2.0-only WITH Classpath-exception-2.0 OR GPL-2.0-only WITH OpenJDK-assembly-exception-1.0
  *******************************************************************************/
 
+#include <stdio.h>
 #include "j9.h"
 #include "j9accessbarrier.h"
 #include "j9cfg.h"
@@ -350,6 +351,12 @@ process_finalizable(J9VMThread *vmThread, j9object_t object, jclass j9VMInternal
 {
 	J9InternalVMFunctions* fns;
 	J9JavaVM *vm;
+	/* DEBUG-INSTRUMENTATION (TestUpcallStress hang): finalizer call rate and per-call latency */
+	static volatile UDATA dbgFinalizeCalls = 0;
+	static volatile UDATA dbgFinalizeTotalMs = 0;
+	PORT_ACCESS_FROM_JAVAVM(vmThread->javaVM);
+	U_64 dbgStart = j9time_current_time_millis();
+	U_64 dbgElapsed = 0;
 
 	vm = vmThread->javaVM;
 	fns = vm->internalVMFunctions;
@@ -370,6 +377,22 @@ process_finalizable(J9VMThread *vmThread, j9object_t object, jclass j9VMInternal
 	}
 
 	((JNIEnv *)vmThread)->DeleteLocalRef(localRef);
+
+	dbgElapsed = j9time_current_time_millis() - dbgStart;
+	dbgFinalizeTotalMs += (UDATA)dbgElapsed;
+	{
+		UDATA n = ++dbgFinalizeCalls;
+		if (dbgElapsed >= 100) {
+			fprintf(stderr, "DBG-FINALIZE SLOW call #%lu took=%llums (CallStaticVoidMethod incl. -Xcheck:jni)\n",
+				(unsigned long)n, (unsigned long long)dbgElapsed);
+			fflush(stderr);
+		}
+		if (0 == (n % 1000)) {
+			fprintf(stderr, "DBG-FINALIZE SUMMARY calls=%lu totalTimeInCalls=%lums avg=%lums\n",
+				(unsigned long)n, (unsigned long)dbgFinalizeTotalMs, (unsigned long)(dbgFinalizeTotalMs / n));
+			fflush(stderr);
+		}
+	}
 
 	fns->internalEnterVMFromJNI(vmThread);
 }
