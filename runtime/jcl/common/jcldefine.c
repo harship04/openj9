@@ -171,7 +171,20 @@ retry:
 		}
 	}
 
-	omrthread_monitor_enter(vm->classTableMutex);
+	{
+		/* JCLDEF-DIAG: temporary diagnostics, remove once the root cause is confirmed */
+		static volatile UDATA diagMsgCount = 0;
+		I_64 diagStartMs = j9time_current_time_millis();
+		I_64 diagWaitMs = 0;
+
+		omrthread_monitor_enter(vm->classTableMutex);
+		diagWaitMs = j9time_current_time_millis() - diagStartMs;
+		if ((diagWaitMs >= 1000) && (diagMsgCount < 200)) {
+			diagMsgCount += 1;
+			j9tty_printf(PORTLIB, "JCLDEF-DIAG: defineClassCommon thread=%p (vmThread=%p) waited %zu ms for classTableMutex\n",
+					omrthread_self(), currentThread, (UDATA)diagWaitMs);
+		}
+	}
 	/* Hidden class is never added into the hash table */
 	if ((NULL != utf8Name) && J9_ARE_NO_BITS_SET(*options, J9_FINDCLASS_FLAG_HIDDEN)) {
 		J9Class *persistedClazz = vmFuncs->hashClassTableAt(classLoader, utf8Name, utf8Length, J9_FINDCLASS_FLAG_DONT_SKIP_FROZEN_JCL_DEFINE_CLASS);

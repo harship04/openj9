@@ -2393,19 +2393,59 @@ jniIsInternalClassRef(J9JavaVM *vm, jobject ref)
 {
 	UDATA rc = FALSE;
 	J9ClassWalkState classWalkState;
-	J9Class *clazz = allLiveClassesStartDo(&classWalkState, vm, NULL);
+	/* JNICHK-DIAG: temporary diagnostics, remove once the root cause is confirmed */
+	PORT_ACCESS_FROM_JAVAVM(vm);
+	static UDATA diagMsgCount = 0; /* racy on purpose: diagnostics only, the cap does not need to be exact */
+	const UDATA diagLoopLimit = ((UDATA)vm->loadedClassCount * 4) + 1000;
+	const I_64 diagStartMs = j9time_current_time_millis();
+	UDATA diagVisited = 0;
+	UDATA diagInnerMax = 0;
+	BOOLEAN diagLoopReported = FALSE;
+	I_64 diagAcquiredMs = 0;
+	J9Class *clazz = NULL;
+
+	clazz = allLiveClassesStartDo(&classWalkState, vm, NULL);
+	diagAcquiredMs = j9time_current_time_millis();
 	while (clazz != NULL) {
+		UDATA diagInner = 0;
+		diagVisited += 1;
+		if (!diagLoopReported && (diagVisited > diagLoopLimit)) {
+			/* Visiting far more classes than are loaded => the walk is looping */
+			diagLoopReported = TRUE;
+			j9tty_printf(PORTLIB, "JNICHK-DIAG: LOOP SUSPECTED in jniIsInternalClassRef: thread=%p ref=%p visited=%zu loadedClassCount=%zu clazz=%p nextSegment=%p heapPtr=%p\n",
+					omrthread_self(), ref, diagVisited, (UDATA)vm->loadedClassCount, clazz, classWalkState.nextSegment, classWalkState.heapPtr);
+		}
 		do {
 			if (ref == (jobject)&clazz->classObject) {
 				rc = TRUE;
 				goto done;
 			}
 			clazz = clazz->replacedClass;
+			diagInner += 1;
+			if (diagInner > diagInnerMax) {
+				diagInnerMax = diagInner;
+			}
+			if (diagInner == 100000) {
+				j9tty_printf(PORTLIB, "JNICHK-DIAG: replacedClass chain >100000 (cycle?) thread=%p ref=%p clazz=%p\n",
+						omrthread_self(), ref, clazz);
+			}
 		} while (NULL != clazz);
 		clazz = allLiveClassesNextDo(&classWalkState);
 	}
 done:
 	allLiveClassesEndDo(&classWalkState);
+	{
+		const I_64 diagEndMs = j9time_current_time_millis();
+		const I_64 diagTotal = diagEndMs - diagStartMs;
+		const I_64 diagWait = diagAcquiredMs - diagStartMs;
+		/* Only report slow scans / slow lock waits, and cap total output */
+		if (((diagTotal >= 50) || (diagWait >= 1000) || diagLoopReported || (diagInnerMax > 1)) && (diagMsgCount < 200)) {
+			diagMsgCount += 1;
+			j9tty_printf(PORTLIB, "JNICHK-DIAG: jniIsInternalClassRef thread=%p ref=%p found=%zu visited=%zu loadedClassCount=%zu lockWaitMs=%zu scanMs=%zu totalMs=%zu maxReplacedChain=%zu\n",
+					omrthread_self(), ref, (UDATA)rc, diagVisited, (UDATA)vm->loadedClassCount,
+					(UDATA)diagWait, (UDATA)(diagEndMs - diagAcquiredMs), (UDATA)diagTotal, diagInnerMax);
+		}
+	}
 	return rc;
 }
 

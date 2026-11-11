@@ -1331,8 +1331,32 @@ jniCheckRef(JNIEnv* env,  const char* function, IDATA argNum, jobject reference)
 		}
 	}
 
+	/* JNICHK-DIAG: temporary diagnostics, only timed/logged on the Finalizer worker thread */
+	UDATA diagIsLocal = 0;
+	if (J9_ARE_ANY_BITS_SET(vmThread->privateFlags, J9_PRIVATE_FLAGS_FINALIZE_WORKER)) {
+		static volatile UDATA diagCalls = 0;
+		static volatile UDATA diagSlowMsgs = 0;
+		PORT_ACCESS_FROM_VMC(vmThread);
+		I_64 diagStartMs = j9time_current_time_millis();
+		I_64 diagElapsedMs = 0;
+
+		diagIsLocal = jniIsLocalRef(env, env, reference);
+		diagElapsedMs = j9time_current_time_millis() - diagStartMs;
+
+		diagCalls += 1;
+		if (((diagElapsedMs >= 50) && (diagSlowMsgs < 100)) || (0 == (diagCalls % 5000))) {
+			if (diagElapsedMs >= 50) {
+				diagSlowMsgs += 1;
+			}
+			j9tty_printf(PORTLIB, "JNICHK-DIAG: jniCheckRef(Finalizer) call#=%zu function=%s argNum=%zd ref=%p isLocal=%zu jniIsLocalRefMs=%zu loadedClassCount=%zu\n",
+					diagCalls, function, (IDATA)argNum, reference, diagIsLocal, (UDATA)diagElapsedMs, (UDATA)vm->loadedClassCount);
+		}
+	} else {
+		diagIsLocal = jniIsLocalRef(env, env, reference);
+	}
+
 	if (
-		jniIsLocalRef(env, env, reference)
+		diagIsLocal
 		|| jniIsGlobalRef(env, reference)
 		|| jniIsWeakGlobalRef(env, reference)
 	) {
